@@ -51,10 +51,14 @@
     "build": {
       "temperature": 0.2
     },
-    // Native opencode subagents. Declared as stubs so they survive every install
-    // path (the filter only deletes named custom agents) AND so the plugin's
-    // ROLE_MODELS can pin them a model — otherwise no subagent survives when both
-    // custom primaries (solo/auto) are declined.
+    // opencode's native subagents. They are defined in opencode's own code, not
+    // in config, so these empty stubs exist ONLY so the plugin's ROLE_MODELS can
+    // pin them a model. NEVER give them an agent/*.md file: opencode applies
+    // `prompt = <file body>` unconditionally, so an empty body would overwrite
+    // their built-in system prompts with "".
+    // The SAIA subagents (coder, coder2, researcher, debugger) live in agent/*.md
+    // — auto-discovered, always installed, never touched by the installer's
+    // filter. Adding one needs no edit here and no edit to any primary.
     "general": {},
     "explore": {},
     "solo": {
@@ -136,81 +140,18 @@
         },
         "write": "deny",
         "task": {
-          // "*" MUST come first: opencode resolves these last-match-wins, so a
-          // trailing "*" would deny every subagent and remove the task tool.
-          "*": "deny",
-          "researcher": "allow",
-          "coder": "allow",
-          "coder2": "allow",
-          "debugger": "allow"
+          // Allow-by-exception: every subagent shipped in agent/*.md is taskable
+          // without editing this file — that is the point. "*" MUST stay FIRST:
+          // opencode resolves these last-match-wins (Permission.findLast), so a
+          // trailing "*" would override the denies below and re-allow them.
+          "*": "allow",
+          // The natives are the failure mode actually observed: under task
+          // pressure auto substituted @general/@explore for its own roles.
+          // Denying them here also removes them from the task tool's generated
+          // agent list, so the model never sees them as an option.
+          "general": "deny",
+          "explore": "deny"
         }
-      },
-      "tools": {
-        "skill": false,
-        "todowrite": false,
-        "webfetch": false
-      }
-    },
-    "coder": {
-      "description": "Implementation agent: executes an audited PLAN, returns CHANGES block",
-      "mode": "subagent",
-      "model": "saia-gwdg/qwen3-coder-next",
-      "temperature": 0.2,
-      "steps": 20,
-      "prompt": "{file:./prompts/coder.md}",
-      "permission": {
-        "edit": "allow",
-        "bash": "allow",
-        "write": "allow"
-      },
-      "tools": {
-        "skill": false
-      }
-    },
-    "coder2": {
-      "description": "Fix-round implementer on a different model family (breaks correlated errors)",
-      "mode": "subagent",
-      "model": "saia-gwdg/glm-4.7",
-      "temperature": 0.2,
-      "steps": 20,
-      "prompt": "{file:./prompts/coder.md}",
-      "permission": {
-        "edit": "allow",
-        "bash": "allow",
-        "write": "allow"
-      },
-      "tools": {
-        "skill": false
-      }
-    },
-    "researcher": {
-      "description": "Read-only analyst: produces PLAN blocks with runnable acceptance criteria",
-      "mode": "subagent",
-      "model": "saia-gwdg/qwen3.5-122b-a10b",
-      "temperature": 0.2,
-      "steps": 8,
-      "prompt": "{file:./prompts/researcher.md}",
-      "permission": {
-        "edit": "deny",
-        "bash": "deny",
-        "write": "deny"
-      },
-      "tools": {
-        "skill": false,
-        "webfetch": false
-      }
-    },
-    "debugger": {
-      "description": "Validator: runs acceptance criteria, returns VERDICT PASS/FAIL with quoted output",
-      "mode": "subagent",
-      "model": "saia-gwdg/qwen3-coder-next",
-      "temperature": 0.1,
-      "steps": 8,
-      "prompt": "{file:./prompts/debugger.md}",
-      "permission": {
-        "edit": "allow",
-        "bash": "allow",
-        "write": "allow"
       },
       "tools": {
         "skill": false,

@@ -2,11 +2,12 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit 01654b2-dirty, packed 2026-09-09T12:52:32Z
+# Source: opencode-config commit 07ed8e1-dirty, packed 2026-09-09T20:26:23Z
 #
-# Installs the GWDG SAIA setup for opencode: provider + plugin, and optional
-# agents (solo, auto, coder, coder2, researcher, debugger) with their prompts.
-# Use flags or interactive prompts to choose which agents to install.
+# Installs the GWDG SAIA setup for opencode: provider + plugin, the four
+# subagents (coder, coder2, researcher, debugger — always installed, as
+# auto-discovered agent/*.md files), and the two OPTIONAL primary agents
+# (solo, auto). Use flags or interactive prompts to choose the primaries.
 #
 # Usage: [GWDG_API_KEY=... GWDG_API_KEYS_EXTRA=key2,key3] bash setup-saia-opencode.sh [OPTIONS]
 #
@@ -27,21 +28,24 @@ usage() {
 Usage: [GWDG_API_KEY=... GWDG_API_KEYS_EXTRA=key2,key3] bash setup-saia-opencode.sh [OPTIONS]
 
 Installs the GWDG SAIA setup for opencode:
-  - opencode.jsonc, plugin/, command/, scripts/, prompts/*.md into ~/.config/opencode
+  - opencode.jsonc, plugin/, command/, scripts/, agent/*.md, prompts/*.md
+    into ~/.config/opencode
   - API key into ~/.local/share/opencode/auth.json (chmod 600)
   - optional extra failover keys (GWDG_API_KEYS_EXTRA, comma-separated) into
     ~/.local/share/opencode/saia-gwdg-keys.json (chmod 600) — the plugin
     switches to the next key when the active one's rate budget is exhausted
   - offers to install opencode itself if missing
-  - optional agents: solo (default workhorse), auto (orchestrator)
+  - subagents @coder, @coder2, @researcher, @debugger — ALWAYS installed as
+    agent/*.md, usable from any primary (including the built-in build agent)
+  - optional PRIMARY agents: solo (default workhorse), auto (orchestrator)
     (default: prompt interactively unless --yes is passed)
 
 Options:
   -y, --yes        answer yes to prompts (e.g. installing opencode)
-       --solo      install the solo agent (default: ask)
-       --auto      install the auto agent (default: ask)
-       --no-solo   skip the solo agent (default: ask)
-       --no-auto   skip the auto agent (default: ask)
+       --solo      install the solo primary agent (default: ask)
+       --auto      install the auto primary agent (default: ask)
+       --no-solo   skip the solo primary agent (default: ask)
+       --no-auto   skip the auto primary agent (default: ask)
        --force-key replace an existing saia-gwdg API key
   -h, --help       show this help
 
@@ -241,10 +245,14 @@ write_file "opencode.jsonc" <<'__OC_FILE_EOF__'
     "build": {
       "temperature": 0.2
     },
-    // Native opencode subagents. Declared as stubs so they survive every install
-    // path (the filter only deletes named custom agents) AND so the plugin's
-    // ROLE_MODELS can pin them a model — otherwise no subagent survives when both
-    // custom primaries (solo/auto) are declined.
+    // opencode's native subagents. They are defined in opencode's own code, not
+    // in config, so these empty stubs exist ONLY so the plugin's ROLE_MODELS can
+    // pin them a model. NEVER give them an agent/*.md file: opencode applies
+    // `prompt = <file body>` unconditionally, so an empty body would overwrite
+    // their built-in system prompts with "".
+    // The SAIA subagents (coder, coder2, researcher, debugger) live in agent/*.md
+    // — auto-discovered, always installed, never touched by the installer's
+    // filter. Adding one needs no edit here and no edit to any primary.
     "general": {},
     "explore": {},
     "solo": {
@@ -326,81 +334,18 @@ write_file "opencode.jsonc" <<'__OC_FILE_EOF__'
         },
         "write": "deny",
         "task": {
-          // "*" MUST come first: opencode resolves these last-match-wins, so a
-          // trailing "*" would deny every subagent and remove the task tool.
-          "*": "deny",
-          "researcher": "allow",
-          "coder": "allow",
-          "coder2": "allow",
-          "debugger": "allow"
+          // Allow-by-exception: every subagent shipped in agent/*.md is taskable
+          // without editing this file — that is the point. "*" MUST stay FIRST:
+          // opencode resolves these last-match-wins (Permission.findLast), so a
+          // trailing "*" would override the denies below and re-allow them.
+          "*": "allow",
+          // The natives are the failure mode actually observed: under task
+          // pressure auto substituted @general/@explore for its own roles.
+          // Denying them here also removes them from the task tool's generated
+          // agent list, so the model never sees them as an option.
+          "general": "deny",
+          "explore": "deny"
         }
-      },
-      "tools": {
-        "skill": false,
-        "todowrite": false,
-        "webfetch": false
-      }
-    },
-    "coder": {
-      "description": "Implementation agent: executes an audited PLAN, returns CHANGES block",
-      "mode": "subagent",
-      "model": "saia-gwdg/qwen3-coder-next",
-      "temperature": 0.2,
-      "steps": 20,
-      "prompt": "{file:./prompts/coder.md}",
-      "permission": {
-        "edit": "allow",
-        "bash": "allow",
-        "write": "allow"
-      },
-      "tools": {
-        "skill": false
-      }
-    },
-    "coder2": {
-      "description": "Fix-round implementer on a different model family (breaks correlated errors)",
-      "mode": "subagent",
-      "model": "saia-gwdg/glm-4.7",
-      "temperature": 0.2,
-      "steps": 20,
-      "prompt": "{file:./prompts/coder.md}",
-      "permission": {
-        "edit": "allow",
-        "bash": "allow",
-        "write": "allow"
-      },
-      "tools": {
-        "skill": false
-      }
-    },
-    "researcher": {
-      "description": "Read-only analyst: produces PLAN blocks with runnable acceptance criteria",
-      "mode": "subagent",
-      "model": "saia-gwdg/qwen3.5-122b-a10b",
-      "temperature": 0.2,
-      "steps": 8,
-      "prompt": "{file:./prompts/researcher.md}",
-      "permission": {
-        "edit": "deny",
-        "bash": "deny",
-        "write": "deny"
-      },
-      "tools": {
-        "skill": false,
-        "webfetch": false
-      }
-    },
-    "debugger": {
-      "description": "Validator: runs acceptance criteria, returns VERDICT PASS/FAIL with quoted output",
-      "mode": "subagent",
-      "model": "saia-gwdg/qwen3-coder-next",
-      "temperature": 0.1,
-      "steps": 8,
-      "prompt": "{file:./prompts/debugger.md}",
-      "permission": {
-        "edit": "allow",
-        "bash": "allow",
-        "write": "allow"
       },
       "tools": {
         "skill": false,
@@ -2051,6 +1996,19 @@ export const server = async (input) => {
           pacerDebugLog(`budget-status injection failed for ${role}: ${e.message}`);
         }
       }
+
+      // @coder2 is @coder on a different model family; they share ONE prompt.
+      // opencode expands {file:...} only inside opencode.json{,c}, never in an
+      // agent/*.md body (ConfigAgent.parse does frontmatter + body and no
+      // substitution), so agent/coder.md is the single source of truth and the
+      // copy happens here instead of duplicating the contract into
+      // agent/coder2.md. Deliberately LAST in this hook: opencode swallows a
+      // config-hook throw, so anything placed above the budget-status loop
+      // could silently disable it.
+      if (config.agent?.coder2 && config.agent?.coder?.prompt) {
+        config.agent.coder2.prompt = config.agent.coder.prompt;
+        pacerDebugLog("coder2 prompt cloned from coder");
+      }
     },
   };
 };
@@ -2377,6 +2335,193 @@ echo "Reasoning effort set to '$ARG' for thinking models."
 echo "Applies to the current session immediately (the pacer re-reads the setting per request)."
 __OC_FILE_EOF__
 
+write_file "agent/coder2.md" <<'__OC_FILE_EOF__'
+---
+description: Fix-round implementer on a different model family (breaks correlated errors)
+mode: subagent
+model: saia-gwdg/glm-4.7
+temperature: 0.2
+steps: 20
+permission:
+  edit: allow
+  bash: allow
+  write: allow
+tools:
+  skill: false
+---
+
+# Coder 2 (fix-round implementer)
+
+Same contract as @coder: implement the audited PLAN exactly, match the
+surrounding code's style, self-check by actually running the fastest relevant
+command, and end every response with the CHANGES block. You exist so that a
+fix round runs on a different model family than the first implementation
+attempt, which breaks correlated errors.
+
+The SAIA plugin replaces this body with @coder's full prompt at startup —
+opencode expands no `{file:...}` reference inside an agent/*.md body, so
+agent/coder.md stays the single source of truth for the shared contract.
+__OC_FILE_EOF__
+
+write_file "agent/coder.md" <<'__OC_FILE_EOF__'
+---
+description: "Implementation agent: executes an audited PLAN, returns CHANGES block"
+mode: subagent
+model: saia-gwdg/qwen3-coder-next
+temperature: 0.2
+steps: 20
+permission:
+  edit: allow
+  bash: allow
+  write: allow
+tools:
+  skill: false
+---
+
+# Coder (implementation agent)
+
+You implement an audited PLAN handed to you by an orchestrator.
+
+## Rules
+
+- Every response step costs one rate-limited API request — batch independent
+  tool calls (multiple reads, several edits, chained bash commands) into a
+  single step instead of one call per step.
+- Implement exactly what the PLAN specifies. Deviations must be declared in
+  your CHANGES block, never made silently.
+- Match the surrounding code's style, naming, and idiom.
+- Before returning, self-check by actually running the fastest relevant
+  command (build, syntax check, targeted test). Report what you ran and the
+  result.
+- Never claim STATUS: COMPLETE if anything failed or was left undone. If you
+  cannot complete the task, return STATUS: BLOCKED with the exact error. A
+  false COMPLETE will be caught by the debugger and costs everyone a round.
+
+## Required output
+
+End every response with exactly this block:
+
+```
+## CHANGES
+STATUS: COMPLETE | PARTIAL | BLOCKED
+FILES TOUCHED:
+- <path> — <summary of change>
+SELF-CHECK: <commands actually run + one-line result each; "none run" if none>
+DEVIATIONS FROM PLAN: <or "none">
+NOTES FOR VALIDATION: <hints for the debugger>
+```
+__OC_FILE_EOF__
+
+write_file "agent/debugger.md" <<'__OC_FILE_EOF__'
+---
+description: "Validator: runs acceptance criteria, returns VERDICT PASS/FAIL with quoted output"
+mode: subagent
+model: saia-gwdg/qwen3-coder-next
+temperature: 0.1
+steps: 8
+permission:
+  edit: allow
+  bash: allow
+  write: allow
+tools:
+  skill: false
+  todowrite: false
+  webfetch: false
+---
+
+# Validator
+
+You validate implementations against acceptance criteria for an orchestrator.
+
+Reading code is NOT validation. You MUST execute every acceptance criterion's
+command and quote its real output.
+
+## Rules
+
+- Every response step costs one rate-limited API request. Run ALL acceptance
+  criteria as a single chained bash invocation in ONE step whenever possible
+  (`cmd1; echo ---; cmd2; echo ---; cmd3`), then quote each command's section
+  from that one run. Only split commands when one criterion depends on the
+  outcome of another. Target: the entire validation in ≤5 steps.
+- Run each acceptance criterion exactly as given; quote the actual output
+  (trim long output to the relevant lines — never fabricate or paraphrase it).
+- If a command cannot run (missing dependency, syntax error, crash), that
+  criterion is FAIL and the error output is the evidence.
+- PASS requires ALL criteria to pass. Never output PASS without quoted command
+  output for every criterion.
+- Do not fix code yourself unless explicitly asked; your job is verdicts, not
+  repairs.
+- For each failure, point to the suspected cause (file:line) and suggest a fix
+  direction — the coder will act on your FAILURES section verbatim.
+
+## Required output
+
+End every validation response with exactly this block:
+
+```
+## VERDICT: PASS | FAIL
+CRITERIA RESULTS:
+1. <criterion> — PASS/FAIL — command run: `<cmd>`
+   output: <verbatim, trimmed>
+FAILURES: (only if FAIL)
+- <criterion #>: symptom, suspected cause (file:line), suggested fix
+```
+__OC_FILE_EOF__
+
+write_file "agent/researcher.md" <<'__OC_FILE_EOF__'
+---
+description: "Read-only analyst: produces PLAN blocks with runnable acceptance criteria"
+mode: subagent
+model: saia-gwdg/qwen3.5-122b-a10b
+temperature: 0.2
+steps: 8
+permission:
+  edit: deny
+  bash: deny
+  write: deny
+tools:
+  skill: false
+  webfetch: false
+---
+
+# Researcher (read-only analyst)
+
+You analyze codebases and requirements for an orchestrator. You have no
+edit/bash/write access — your output is findings and plans, nothing else.
+
+## Rules
+
+- Every response step costs one rate-limited API request — batch independent
+  tool calls (multiple reads/globs/greps) into a single step instead of one
+  call per step.
+- Cite exact file paths and line numbers for every claim about the code.
+- Do not speculate: verify claims by actually reading the files. If you could
+  not verify something, say so explicitly.
+- Prefer reusing existing functions, utilities, and patterns you find over
+  proposing new code — name them with their paths.
+- Every ACCEPTANCE CRITERION must be a command the debugger can execute
+  (build, test, script, curl, grep on output) with an expected observable
+  result. "Code is clean" or "works correctly" is not a criterion.
+- STEPS must be concrete enough that an implementer needs no further research.
+
+## Required output
+
+End every planning response with exactly this block:
+
+```
+## PLAN
+GOAL: <one sentence>
+CONSTRAINTS: <hard requirements, things that must not break>
+FILES TO CHANGE:
+- <path> — <what changes and why> (mark NEW if to be created)
+STEPS:
+1. <ordered, concrete implementation steps>
+ACCEPTANCE CRITERIA:
+1. <a runnable command> → <expected observable output/exit code>
+RISKS: <what could go wrong, edge cases>
+```
+__OC_FILE_EOF__
+
 write_file "prompts/auto.md" <<'__OC_FILE_EOF__'
 # Orchestrator
 
@@ -2454,9 +2599,11 @@ of your steps — and each subagent step — costs one request. Therefore:
 If a subagent errors out or returns without its required block (PLAN /
 CHANGES / VERDICT), re-task that SAME agent exactly ONCE, stating what was
 missing or what error occurred. If it fails again, STOP and report failure
-to the user. NEVER substitute a different agent type (no @general, @explore,
-or anything else) — only @researcher, @coder, @coder2, and @debugger exist,
-and @coder2 is reserved for Phase 4 fix rounds.
+to the user. NEVER substitute a different agent type as a stand-in: @general
+and @explore are denied to you and must never be used for one of your roles.
+The `task` tool's own list of agent types is authoritative — if an agent is
+not in that list, it does not exist for you. @coder2 is reserved for Phase 4
+fix rounds.
 
 EXCEPTION — transport errors. If the failure message contains "operation timed
 out", "stream stalled", "not resumable in-stream", "Internal Server Error" or
@@ -2581,120 +2728,6 @@ CRITERIA RESULTS:
    output: <verbatim, trimmed>
 FAILURES: (only if FAIL)
 - <criterion #>: symptom, suspected cause (file:line), suggested fix
-```
-__OC_FILE_EOF__
-
-write_file "prompts/coder.md" <<'__OC_FILE_EOF__'
-# Coder (implementation agent)
-
-You implement an audited PLAN handed to you by an orchestrator.
-
-## Rules
-
-- Every response step costs one rate-limited API request — batch independent
-  tool calls (multiple reads, several edits, chained bash commands) into a
-  single step instead of one call per step.
-- Implement exactly what the PLAN specifies. Deviations must be declared in
-  your CHANGES block, never made silently.
-- Match the surrounding code's style, naming, and idiom.
-- Before returning, self-check by actually running the fastest relevant
-  command (build, syntax check, targeted test). Report what you ran and the
-  result.
-- Never claim STATUS: COMPLETE if anything failed or was left undone. If you
-  cannot complete the task, return STATUS: BLOCKED with the exact error. A
-  false COMPLETE will be caught by the debugger and costs everyone a round.
-
-## Required output
-
-End every response with exactly this block:
-
-```
-## CHANGES
-STATUS: COMPLETE | PARTIAL | BLOCKED
-FILES TOUCHED:
-- <path> — <summary of change>
-SELF-CHECK: <commands actually run + one-line result each; "none run" if none>
-DEVIATIONS FROM PLAN: <or "none">
-NOTES FOR VALIDATION: <hints for the debugger>
-```
-__OC_FILE_EOF__
-
-write_file "prompts/debugger.md" <<'__OC_FILE_EOF__'
-# Validator
-
-You validate implementations against acceptance criteria for an orchestrator.
-
-Reading code is NOT validation. You MUST execute every acceptance criterion's
-command and quote its real output.
-
-## Rules
-
-- Every response step costs one rate-limited API request. Run ALL acceptance
-  criteria as a single chained bash invocation in ONE step whenever possible
-  (`cmd1; echo ---; cmd2; echo ---; cmd3`), then quote each command's section
-  from that one run. Only split commands when one criterion depends on the
-  outcome of another. Target: the entire validation in ≤5 steps.
-- Run each acceptance criterion exactly as given; quote the actual output
-  (trim long output to the relevant lines — never fabricate or paraphrase it).
-- If a command cannot run (missing dependency, syntax error, crash), that
-  criterion is FAIL and the error output is the evidence.
-- PASS requires ALL criteria to pass. Never output PASS without quoted command
-  output for every criterion.
-- Do not fix code yourself unless explicitly asked; your job is verdicts, not
-  repairs.
-- For each failure, point to the suspected cause (file:line) and suggest a fix
-  direction — the coder will act on your FAILURES section verbatim.
-
-## Required output
-
-End every validation response with exactly this block:
-
-```
-## VERDICT: PASS | FAIL
-CRITERIA RESULTS:
-1. <criterion> — PASS/FAIL — command run: `<cmd>`
-   output: <verbatim, trimmed>
-FAILURES: (only if FAIL)
-- <criterion #>: symptom, suspected cause (file:line), suggested fix
-```
-__OC_FILE_EOF__
-
-write_file "prompts/researcher.md" <<'__OC_FILE_EOF__'
-# Researcher (read-only analyst)
-
-You analyze codebases and requirements for an orchestrator. You have no
-edit/bash/write access — your output is findings and plans, nothing else.
-
-## Rules
-
-- Every response step costs one rate-limited API request — batch independent
-  tool calls (multiple reads/globs/greps) into a single step instead of one
-  call per step.
-- Cite exact file paths and line numbers for every claim about the code.
-- Do not speculate: verify claims by actually reading the files. If you could
-  not verify something, say so explicitly.
-- Prefer reusing existing functions, utilities, and patterns you find over
-  proposing new code — name them with their paths.
-- Every ACCEPTANCE CRITERION must be a command the debugger can execute
-  (build, test, script, curl, grep on output) with an expected observable
-  result. "Code is clean" or "works correctly" is not a criterion.
-- STEPS must be concrete enough that an implementer needs no further research.
-
-## Required output
-
-End every planning response with exactly this block:
-
-```
-## PLAN
-GOAL: <one sentence>
-CONSTRAINTS: <hard requirements, things that must not break>
-FILES TO CHANGE:
-- <path> — <what changes and why> (mark NEW if to be created)
-STEPS:
-1. <ordered, concrete implementation steps>
-ACCEPTANCE CRITERIA:
-1. <a runnable command> → <expected observable output/exit code>
-RISKS: <what could go wrong, edge cases>
 ```
 __OC_FILE_EOF__
 
@@ -2929,19 +2962,17 @@ data = json.loads(content)
 
 agent = data.get("agent", {})
 
-# NOTE: never add "general"/"explore" to any deletion list below — they are
-# opencode's native subagents and must survive every install path so the user
-# always has at least one working subagent, even when both primaries are declined.
-
-# Remove unused agent blocks based on flags
+# Only the two optional PRIMARIES live in opencode.jsonc and may be filtered.
+# The SAIA subagents (coder, coder2, researcher, debugger) ship as agent/*.md,
+# are auto-discovered, and are deliberately not represented here — so declining
+# both primaries still leaves a full set of working subagents for the built-in
+# build/plan agents (opencode's native ruleset allows `task` by default).
+# NOTE: never add "general"/"explore" to any deletion list either — they are
+# opencode's native subagents and their stubs exist only for model pinning.
 if install_solo == 0 and "solo" in agent:
     del agent["solo"]
-if install_auto == 0:
-    for a in ["auto", "coder", "coder2", "researcher"]:
-        if a in agent:
-            del agent[a]
-if install_solo == 0 and "debugger" in agent:
-    del agent["debugger"]
+if install_auto == 0 and "auto" in agent:
+    del agent["auto"]
 
 # Clean up empty agent dict
 if not agent:
@@ -2964,23 +2995,29 @@ PYEOF
 
 # Clean up prompt files that are disabled
 cleanup_disabled_prompts() {
-  # Only remove solo and debugger when neither orchestrator is installed
-  # (auto also uses @debugger for Phase 3 validation)
-  if [[ $INSTALL_SOLO -eq 0 ]] && [[ $INSTALL_AUTO -eq 0 ]]; then
+  # Only the two PRIMARY prompts are optional, and they are independent of each
+  # other. Nothing else may be removed: each subagent's prompt is the body of
+  # its own agent/*.md and always installs. The old cross-conditions here were
+  # the install-time coupling — including the bug where "--auto --no-solo" left
+  # auto's mandatory @debugger validator undefined.
+  if [[ $INSTALL_SOLO -eq 0 ]]; then
     rm -f "$CONFIG_DIR/prompts/solo.md"
-    rm -f "$CONFIG_DIR/prompts/debugger.md"
     log "  removed (disabled): prompts/solo.md"
-    log "  removed (disabled): prompts/debugger.md"
   fi
-  
+
   if [[ $INSTALL_AUTO -eq 0 ]]; then
     rm -f "$CONFIG_DIR/prompts/auto.md"
-    rm -f "$CONFIG_DIR/prompts/coder.md"
-    rm -f "$CONFIG_DIR/prompts/researcher.md"
     log "  removed (disabled): prompts/auto.md"
-    log "  removed (disabled): prompts/coder.md"
-    log "  removed (disabled): prompts/researcher.md"
   fi
+
+  # Orphans from installs that predate agent/*.md: these three are now the
+  # bodies of agent/{coder,researcher,debugger}.md and nothing reads them.
+  for stale in coder researcher debugger; do
+    if [[ -f "$CONFIG_DIR/prompts/$stale.md" ]]; then
+      rm -f "$CONFIG_DIR/prompts/$stale.md"
+      log "  removed (superseded by agent/$stale.md): prompts/$stale.md"
+    fi
+  done
 }
 
 verify() {
@@ -3003,18 +3040,19 @@ verify() {
     if [[ $INSTALL_SOLO -eq 1 ]] && [[ $INSTALL_AUTO -eq 1 ]]; then
       log "Next steps: run 'opencode', press Tab until the 'solo' agent (default"
       log "workhorse) or 'auto' (orchestrator for big tasks) is selected, and give"
-      log "it a task. Subagents: @coder, @coder2, @researcher, @debugger."
+      log "it a task."
     elif [[ $INSTALL_SOLO -eq 1 ]]; then
       log "Next steps: run 'opencode', select the 'solo' agent (default workhorse),"
-      log "and give it a task. Subagent: @debugger."
+      log "and give it a task. It delegates validation to @debugger."
     elif [[ $INSTALL_AUTO -eq 1 ]]; then
       log "Next steps: run 'opencode', select the 'auto' agent (orchestrator for"
-      log "big tasks), and give it a task. Subagents: @coder, @coder2, @researcher"
-      log "(debugger only when needed)."
+      log "big tasks), and give it a task."
     else
       log "Next steps: run 'opencode' with the built-in agents (build, plan)."
-      log "Install solo/auto later to get full functionality."
+      log "Install solo/auto later for their orchestration workflows."
     fi
+    log "Subagents @coder, @coder2, @researcher and @debugger are always"
+    log "installed (agent/*.md) and taskable from any primary."
     log "Force-refresh the weekly model cache with /reload_models."
   else
     {

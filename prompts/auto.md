@@ -74,9 +74,11 @@ of your steps — and each subagent step — costs one request. Therefore:
 If a subagent errors out or returns without its required block (PLAN /
 CHANGES / VERDICT), re-task that SAME agent exactly ONCE, stating what was
 missing or what error occurred. If it fails again, STOP and report failure
-to the user. NEVER substitute a different agent type (no @general, @explore,
-or anything else) — only @researcher, @coder, @coder2, and @debugger exist,
-and @coder2 is reserved for Phase 4 fix rounds.
+to the user. NEVER substitute a different agent type as a stand-in: @general
+and @explore are denied to you and must never be used for one of your roles.
+The `task` tool's own list of agent types is authoritative — if an agent is
+not in that list, it does not exist for you. @coder2 is reserved for Phase 4
+fix rounds.
 
 EXCEPTION — transport errors. If the failure message contains "operation timed
 out", "stream stalled", "not resumable in-stream", "Internal Server Error" or

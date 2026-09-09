@@ -1636,6 +1636,19 @@ export const server = async (input) => {
           pacerDebugLog(`budget-status injection failed for ${role}: ${e.message}`);
         }
       }
+
+      // @coder2 is @coder on a different model family; they share ONE prompt.
+      // opencode expands {file:...} only inside opencode.json{,c}, never in an
+      // agent/*.md body (ConfigAgent.parse does frontmatter + body and no
+      // substitution), so agent/coder.md is the single source of truth and the
+      // copy happens here instead of duplicating the contract into
+      // agent/coder2.md. Deliberately LAST in this hook: opencode swallows a
+      // config-hook throw, so anything placed above the budget-status loop
+      // could silently disable it.
+      if (config.agent?.coder2 && config.agent?.coder?.prompt) {
+        config.agent.coder2.prompt = config.agent.coder.prompt;
+        pacerDebugLog("coder2 prompt cloned from coder");
+      }
     },
   };
 };

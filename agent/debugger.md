@@ -1,3 +1,19 @@
+---
+description: "Validator: runs acceptance criteria, returns VERDICT PASS/FAIL with quoted output"
+mode: subagent
+model: saia-gwdg/qwen3-coder-next
+temperature: 0.1
+steps: 8
+permission:
+  edit: allow
+  bash: allow
+  write: allow
+tools:
+  skill: false
+  todowrite: false
+  webfetch: false
+---
+
 # Validator
 
 You validate implementations against acceptance criteria for an orchestrator.

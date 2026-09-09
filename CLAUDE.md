@@ -18,28 +18,34 @@ This file provides guidance to Claude Code when working with this opencode SAIA 
 
 The repo uses opencode's auto-discovered folders (installed 1:1 into `~/.config/opencode`).
 
-1. `opencode.jsonc` — static config (provider + inline agent definitions; no `plugin`/`command` blocks)
+1. `opencode.jsonc` — static config (provider + the **primary** agents `solo`/`auto`, plus model-pinning stubs for `plan`/`build`/`general`/`explore`; no `plugin`/`command` blocks)
 2. `plugin/saia-gwdg-plugin.js` — runtime plugin, **auto-discovered** from `plugin/` (model list, budget tracking, prompt injection)
 3. `command/*.md` — slash commands (`/usage`, `/reload_models`, `/effort`), auto-discovered; backed by `scripts/*.sh`
-4. `prompts/*.md` — agent system prompts (loaded at runtime)
-5. `tool/`, `skill/` — scaffolds for future custom tools / skills
+4. `agent/*.md` — the four **subagents** (`coder`, `coder2`, `researcher`, `debugger`): YAML frontmatter (same schema as an `opencode.jsonc` agent block) + the prompt as the body, auto-discovered from `{agent,agents}/**/*.md`. Always installed, independent of which primaries were selected
+5. `prompts/*.md` — system prompts for the two optional primaries only (`auto.md`, `solo.md`); they stay separate files because the plugin templates `__SAIA_BUDGET_STATUS__` into them
+6. `tool/`, `skill/` — scaffolds for future custom tools / skills
 
 ## Gotchas
 
 - `setup-saia-opencode.sh` is generated — never edit directly; regenerate after any config change
 - Rate limits: 30 req/min, 200/hour, 1000/day, 3000/month shared across all agents
-- In `opencode.jsonc`, `"*": "deny"` in `agent.auto.permission.task` and `agent.solo.permission.task` MUST come before named allows (last-match-wins)
+- `permission.task` is resolved **last-match-wins**, so the wildcard MUST come first in both primaries. `agent.auto.permission.task` is allow-by-exception (`"*": "allow"` then `general`/`explore` denied — so a new `agent/*.md` is taskable with no edit); `agent.solo.permission.task` is deny-by-exception (`"*": "deny"` then `debugger` allowed — deliberate: solo's cost contract is ~5-12 requests/task and its roster does not grow)
+- Adding a subagent = adding one `agent/<name>.md` + one `ROLE_MODELS` entry in the plugin. No edit to any primary. Do add it to `prompts/auto.md`'s workflow description if `auto` should actually use it
+- `agent/*.md` bodies get **no** `{file:...}` or `@`-include expansion (opencode substitutes only inside `opencode.json{,c}`) — that is why `coder2`'s prompt is cloned from `coder`'s by the plugin at config time, and why the moved prompts live in the md bodies
+- Never create `agent/general.md` or `agent/explore.md`: opencode assigns `prompt = <file body>` unconditionally, so an empty body would overwrite their built-in system prompts with `""`. Their `{}` stubs in `opencode.jsonc` exist only so `ROLE_MODELS` can pin them a model
+- `mode: subagent` is mandatory in every `agent/*.md` — without it opencode defaults the agent to `mode: "all"` and lists it as a primary in Tab-cycling. `build-setup.sh` fails the build if it is missing
+- Malformed `agent/*.md` frontmatter (e.g. a quoted number for `steps`) is a **fatal** opencode startup error, not a degraded feature — the decode throws inside an uncaught `Effect.promise`
 - `__SAIA_BUDGET_STATUS__` placeholder in `prompts/auto.md` and `prompts/solo.md` — never rename
 - Plugin silently fails if `auth.json` is missing or models fetch fails with no valid cache
 - Plugin & commands are auto-discovered — do NOT re-add a `plugin` array or `command` block to `opencode.jsonc`
-- `prompts/` must stay a direct child of the config root: the plugin reads `../prompts/{auto,solo}.md` from `plugin/`, and `{file:./prompts/*.md}` resolves relative to `opencode.jsonc`
-- `build-setup.sh` glob-packs `tool/*.{js,ts}` and `skill/**/SKILL.md`, so real tools/skills added to those folders ship automatically (the scaffold READMEs are not packed)
+- `prompts/` and `agent/` must stay direct children of the config root: the plugin reads `../prompts/{auto,solo}.md` from `plugin/`, `{file:./prompts/*.md}` resolves relative to `opencode.jsonc`, and opencode scans `{agent,agents}/**/*.md` per config directory. Keep `agent/` flat — the glob is recursive, so `agent/sub/x.md` would name the agent `sub/x`
+- `build-setup.sh` glob-packs `agent/*.md`, `tool/*.{js,ts}` and `skill/**/SKILL.md`, so agents/tools/skills added to those folders ship automatically (the scaffold READMEs are not packed). `agent/*.md` is appended to `MANIFEST`, so unlike `tool/`/`skill/` it also gets the delimiter, trailing-newline and frontmatter checks
 - `.opencode.bak/` is an old backup — gitignored
 - The plugin owns stall detection. `chunkTimeout` in `opencode.jsonc` is a backstop and **MUST stay above `SLOW_IDLE_TIMEOUT_MS` (90s)** — opencode implements it as an abort on the signal it hands the patched fetch, so a lower value fires first, the plugin reads it as a caller abort and refuses to retry, silently killing the whole stream-resume path (this is exactly what `chunkTimeout: 30000` did for 12 days). Do **not** add `timeout`/`headerTimeout` to the provider options either — opencode measures those around the patched `globalThis.fetch`, so they would include the pacer's queue wait, 30s cooldown and 429 sleeps and abort healthy requests
 - The pacer's headers deadline must never span the response body. It is an explicit `AbortController` cleared in a `finally` around the `realFetch` await only; widening that `finally` over the body reads re-introduces the bug where every turn longer than 45s was killed at exactly 45s
 - A mid-stream stall is only resumed for **text**. Once `delta.tool_calls` arguments have streamed, the turn is failed (`stream-toolcall-abandon`) rather than retried — opencode's SSE accumulator already holds a partial call, so a second sequence corrupts the args or duplicates the call. Session auto-resume re-plans it instead
-- `test/` is test-only and deliberately not packed by `build-setup.sh` (which packs named files plus `tool/*.{js,ts}` and `skill/**/SKILL.md`). Running the matrix does overwrite `saia-gwdg-budget.json` with the fake endpoint's rate-limit headers; the next real request corrects it
+- `test/` is test-only and deliberately not packed by `build-setup.sh` (which packs named files plus `agent/*.md`, `tool/*.{js,ts}` and `skill/**/SKILL.md`). Running the matrix does overwrite `saia-gwdg-budget.json` with the fake endpoint's rate-limit headers; the next real request corrects it
 - SAIA sends `x-kong-request-id`, not `x-request-id` — the latter is always null and is what GWDG needs for correlation
-- Running the installer without `--solo --auto` silently strips those agents from the live config and deletes `prompts/*.md`; see `saia-backend-findings.md` for the SAIA 500/hang investigation
+- Running the installer without `--solo --auto` removes those two **primaries** from the live config and deletes their `prompts/{solo,auto}.md`. It no longer touches the subagents: they ship as `agent/*.md` and the install-time filter only ever deletes `solo`/`auto`. (Before this change `--no-auto` also deleted `coder`/`coder2`/`researcher`, and `--no-solo` deleted `debugger` — which left `--auto --no-solo` with an `auto` whose prompt mandates a `@debugger` that did not exist.)
 
 See `AGENTS.md` for detailed agent architecture and `SETUP.md` for installation instructions.

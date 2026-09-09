@@ -19,11 +19,12 @@ auto-discovered folders.
 
 | File / dir | Purpose |
 |------------|---------|
-| `opencode.jsonc` | Main config: provider + agent definitions (plugin & commands are auto-discovered from their folders — no `plugin`/`command` entries here) |
+| `opencode.jsonc` | Main config: provider + the two optional **primary** agents (`solo`, `auto`) and model-pinning stubs (plugin, commands & subagents are auto-discovered from their folders — no `plugin`/`command` entries here) |
 | `plugin/saia-gwdg-plugin.js` | Runtime plugin (auto-discovered): live model list, request pacer (incl. reasoning-effort injection), budget tracking, prompt injection |
 | `command/` | Custom slash commands as markdown — `/usage`, `/reload_models`, `/effort` |
 | `scripts/` | Backing shell scripts for the commands (`usage.sh`, `reload-models.sh`, `effort.sh`) |
-| `prompts/` | Agent system prompts, referenced via `{file:./prompts/*.md}` |
+| `agent/` | The four **subagents** as one file each (`coder`, `coder2`, `researcher`, `debugger`): frontmatter + prompt body, auto-discovered — always installed |
+| `prompts/` | System prompts for the two optional primaries (`auto.md`, `solo.md`), referenced via `{file:./prompts/*.md}` |
 | `tool/`, `skill/` | Scaffolds (with READMEs) for future opencode custom tools / skills — see [How the folders work](#how-the-folders-work) |
 | `yagni.md` | Global instruction appended to every agent's prompt |
 | `build-setup.sh` | Regenerates the installer |
@@ -39,12 +40,23 @@ of these folders — dropping a correctly-shaped file into one is all it takes t
 prompt, command, tool, or skill. `build-setup.sh` globs the same folders when it
 regenerates the installer, so anything you add ships automatically.
 
-**`prompts/` — agent system prompts.** Each custom agent loads its prompt from here via
-`"prompt": "{file:./prompts/*.md}"` in `opencode.jsonc`. The plugin
-(`plugin/saia-gwdg-plugin.js`) also reads `prompts/auto.md` and `prompts/solo.md` at
-startup and swaps the `__SAIA_BUDGET_STATUS__` placeholder for the live budget line. This
-folder must stay a direct child of the config root — the plugin reads `../prompts/…`
-relative to `plugin/`, and `{file:./prompts/*.md}` resolves relative to `opencode.jsonc`.
+**`agent/` — the subagents, one file each.** opencode auto-discovers
+`{agent,agents}/**/*.md`, so `agent/coder.md` *is* the `coder` subagent: YAML frontmatter
+using the same schema as an `opencode.jsonc` agent block, and the body as its system
+prompt. Nothing has to reference them, which is the point — they install and work whether
+or not you selected the `solo`/`auto` primaries, and adding one means adding one file
+(plus a `ROLE_MODELS` entry so the plugin can pin it a ready SAIA model). Two rules:
+`mode: subagent` is mandatory, and there is **no** `{file:...}` expansion inside a body —
+that is why `coder2`, which shares `coder`'s contract, gets its prompt cloned by the
+plugin at startup instead of referencing it.
+
+**`prompts/` — the primary agents' system prompts.** `solo` and `auto` load theirs from
+here via `"prompt": "{file:./prompts/*.md}"` in `opencode.jsonc`. They stay separate files
+because the plugin (`plugin/saia-gwdg-plugin.js`) reads `prompts/auto.md` and
+`prompts/solo.md` at startup and swaps the `__SAIA_BUDGET_STATUS__` placeholder for the
+live budget line, and because either primary can be declined at install time. This folder
+must stay a direct child of the config root — the plugin reads `../prompts/…` relative to
+`plugin/`, and `{file:./prompts/*.md}` resolves relative to `opencode.jsonc`.
 
 **`command/` + `scripts/` — slash commands and their backing scripts.** `command/*.md` are
 auto-discovered slash commands (`/usage`, `/reload_models`, `/effort`). The markdown is thin: it
@@ -72,8 +84,9 @@ see [`tool/README.md`](tool/README.md) for the authoring convention.
 `skill/**/SKILL.md`. No skills exist yet — see [`skill/README.md`](skill/README.md) for the
 authoring convention.
 
-The `skill` tool is **disabled on every custom agent** (`"tools": { "skill": false }` on
-`solo`, `auto`, `coder`, `coder2`, `researcher`, `debugger`), on purpose:
+The `skill` tool is **disabled on every custom agent** — `"tools": { "skill": false }` on
+`solo`/`auto` in `opencode.jsonc`, and `tools: {skill: false}` in each `agent/*.md`
+frontmatter for `coder`, `coder2`, `researcher`, `debugger` — on purpose:
 
 - Every tool call is a metered request against tight shared SAIA limits (see `AGENTS.md`),
   so an unused tool is pure cost.

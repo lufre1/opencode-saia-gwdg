@@ -2,8 +2,9 @@
 #
 # build-setup.sh — pack the live SAIA config into setup-saia-opencode.sh
 #
-# Reads the current opencode.jsonc, plugin/, command/, scripts/, and prompts/*.md
-# and emits a single self-contained installer that can be copied to other devices.
+# Reads the current opencode.jsonc, plugin/, command/, scripts/, agent/*.md and
+# prompts/*.md and emits a single self-contained installer that can be copied to
+# other devices.
 # Rerun this after ANY change to those files, and commit both.
 #
 set -euo pipefail
@@ -22,11 +23,23 @@ MANIFEST=(
   scripts/reload-models.sh
   scripts/effort.sh
   prompts/auto.md
-  prompts/coder.md
-  prompts/debugger.md
-  prompts/researcher.md
   prompts/solo.md
 )
+
+# Agent definitions are folder-driven: opencode auto-discovers agent/*.md, so
+# every file in that folder ships. Appended to MANIFEST so the delimiter,
+# trailing-newline and git-dirty checks below cover them too — unlike tool/*
+# and skill/**, which are packed unchecked. Agent files must not skip the
+# checks: malformed frontmatter is a FATAL opencode startup error (the decode
+# throws inside an uncaught Effect.promise), not a degraded feature.
+shopt -s nullglob
+AGENT_FILES=(agent/*.md)
+shopt -u nullglob
+if [[ ${#AGENT_FILES[@]} -eq 0 ]]; then
+  echo "ERROR: no agent/*.md found — the SAIA subagents would not ship" >&2
+  exit 1
+fi
+MANIFEST+=("${AGENT_FILES[@]}")
 
 # ── Sanity checks ────────────────────────────────────────────────────
 for f in "${MANIFEST[@]}"; do
@@ -41,6 +54,23 @@ for f in "${MANIFEST[@]}"; do
   if [[ -n "$(tail -c 1 "$f")" ]]; then
     echo "ERROR: $f lacks a trailing newline (heredoc packing would add one)" >&2
     exit 1
+  fi
+  # Catch a broken agent definition HERE rather than at the user's next launch:
+  # opencode hard-fails to start on frontmatter it cannot decode.
+  if [[ $f == agent/*.md ]]; then
+    if [[ "$(head -1 "$f")" != "---" ]]; then
+      echo "ERROR: $f does not start with a '---' frontmatter delimiter" >&2
+      exit 1
+    fi
+    if [[ "$(grep -c '^---$' "$f")" -lt 2 ]]; then
+      echo "ERROR: $f has an unterminated frontmatter block" >&2
+      exit 1
+    fi
+    if ! grep -q '^mode: subagent$' "$f"; then
+      echo "ERROR: $f lacks 'mode: subagent' — opencode would default it to" >&2
+      echo "       mode 'all' and list it as a primary in Tab-cycling" >&2
+      exit 1
+    fi
   fi
 done
 
@@ -60,9 +90,10 @@ cat >"$TMP_OUT" <<OC_GEN_HEADER
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
 # Source: opencode-config commit $COMMIT$DIRTY, packed $STAMP
 #
-# Installs the GWDG SAIA setup for opencode: provider + plugin, and optional
-# agents (solo, auto, coder, coder2, researcher, debugger) with their prompts.
-# Use flags or interactive prompts to choose which agents to install.
+# Installs the GWDG SAIA setup for opencode: provider + plugin, the four
+# subagents (coder, coder2, researcher, debugger — always installed, as
+# auto-discovered agent/*.md files), and the two OPTIONAL primary agents
+# (solo, auto). Use flags or interactive prompts to choose the primaries.
 #
 # Usage: [GWDG_API_KEY=... GWDG_API_KEYS_EXTRA=key2,key3] bash setup-saia-opencode.sh [OPTIONS]
 #
@@ -87,21 +118,24 @@ usage() {
 Usage: [GWDG_API_KEY=... GWDG_API_KEYS_EXTRA=key2,key3] bash setup-saia-opencode.sh [OPTIONS]
 
 Installs the GWDG SAIA setup for opencode:
-  - opencode.jsonc, plugin/, command/, scripts/, prompts/*.md into ~/.config/opencode
+  - opencode.jsonc, plugin/, command/, scripts/, agent/*.md, prompts/*.md
+    into ~/.config/opencode
   - API key into ~/.local/share/opencode/auth.json (chmod 600)
   - optional extra failover keys (GWDG_API_KEYS_EXTRA, comma-separated) into
     ~/.local/share/opencode/saia-gwdg-keys.json (chmod 600) — the plugin
     switches to the next key when the active one's rate budget is exhausted
   - offers to install opencode itself if missing
-  - optional agents: solo (default workhorse), auto (orchestrator)
+  - subagents @coder, @coder2, @researcher, @debugger — ALWAYS installed as
+    agent/*.md, usable from any primary (including the built-in build agent)
+  - optional PRIMARY agents: solo (default workhorse), auto (orchestrator)
     (default: prompt interactively unless --yes is passed)
 
 Options:
   -y, --yes        answer yes to prompts (e.g. installing opencode)
-       --solo      install the solo agent (default: ask)
-       --auto      install the auto agent (default: ask)
-       --no-solo   skip the solo agent (default: ask)
-       --no-auto   skip the auto agent (default: ask)
+       --solo      install the solo primary agent (default: ask)
+       --auto      install the auto primary agent (default: ask)
+       --no-solo   skip the solo primary agent (default: ask)
+       --no-auto   skip the auto primary agent (default: ask)
        --force-key replace an existing saia-gwdg API key
   -h, --help       show this help
 
@@ -272,8 +306,15 @@ pack scripts/usage.sh
 pack scripts/reload-models.sh
 pack scripts/effort.sh
 
-# Agent prompts (cleanup_disabled_prompts removes disabled ones post-install;
-# coder2 reuses prompts/coder.md — there is no coder2.md).
+# Subagent definitions (frontmatter + prompt in one file), auto-discovered by
+# opencode from agent/. These ship unconditionally — the install-time filter
+# only ever touches the two optional primaries in opencode.jsonc.
+for a in "${AGENT_FILES[@]}"; do pack "$a"; done
+
+# Prompts for the two optional PRIMARIES only. They stay separate files (rather
+# than agent/*.md bodies) because both carry __SAIA_BUDGET_STATUS__ and are
+# templated by the plugin at startup, and because the installer may decline
+# either one. cleanup_disabled_prompts removes a declined primary's prompt.
 for p in prompts/*.md; do pack "$p"; done
 
 # Custom tools + skills — folder-driven, so files added later ship automatically.
@@ -445,19 +486,17 @@ data = json.loads(content)
 
 agent = data.get("agent", {})
 
-# NOTE: never add "general"/"explore" to any deletion list below — they are
-# opencode's native subagents and must survive every install path so the user
-# always has at least one working subagent, even when both primaries are declined.
-
-# Remove unused agent blocks based on flags
+# Only the two optional PRIMARIES live in opencode.jsonc and may be filtered.
+# The SAIA subagents (coder, coder2, researcher, debugger) ship as agent/*.md,
+# are auto-discovered, and are deliberately not represented here — so declining
+# both primaries still leaves a full set of working subagents for the built-in
+# build/plan agents (opencode's native ruleset allows `task` by default).
+# NOTE: never add "general"/"explore" to any deletion list either — they are
+# opencode's native subagents and their stubs exist only for model pinning.
 if install_solo == 0 and "solo" in agent:
     del agent["solo"]
-if install_auto == 0:
-    for a in ["auto", "coder", "coder2", "researcher"]:
-        if a in agent:
-            del agent[a]
-if install_solo == 0 and "debugger" in agent:
-    del agent["debugger"]
+if install_auto == 0 and "auto" in agent:
+    del agent["auto"]
 
 # Clean up empty agent dict
 if not agent:
@@ -480,23 +519,29 @@ PYEOF
 
 # Clean up prompt files that are disabled
 cleanup_disabled_prompts() {
-  # Only remove solo and debugger when neither orchestrator is installed
-  # (auto also uses @debugger for Phase 3 validation)
-  if [[ $INSTALL_SOLO -eq 0 ]] && [[ $INSTALL_AUTO -eq 0 ]]; then
+  # Only the two PRIMARY prompts are optional, and they are independent of each
+  # other. Nothing else may be removed: each subagent's prompt is the body of
+  # its own agent/*.md and always installs. The old cross-conditions here were
+  # the install-time coupling — including the bug where "--auto --no-solo" left
+  # auto's mandatory @debugger validator undefined.
+  if [[ $INSTALL_SOLO -eq 0 ]]; then
     rm -f "$CONFIG_DIR/prompts/solo.md"
-    rm -f "$CONFIG_DIR/prompts/debugger.md"
     log "  removed (disabled): prompts/solo.md"
-    log "  removed (disabled): prompts/debugger.md"
   fi
-  
+
   if [[ $INSTALL_AUTO -eq 0 ]]; then
     rm -f "$CONFIG_DIR/prompts/auto.md"
-    rm -f "$CONFIG_DIR/prompts/coder.md"
-    rm -f "$CONFIG_DIR/prompts/researcher.md"
     log "  removed (disabled): prompts/auto.md"
-    log "  removed (disabled): prompts/coder.md"
-    log "  removed (disabled): prompts/researcher.md"
   fi
+
+  # Orphans from installs that predate agent/*.md: these three are now the
+  # bodies of agent/{coder,researcher,debugger}.md and nothing reads them.
+  for stale in coder researcher debugger; do
+    if [[ -f "$CONFIG_DIR/prompts/$stale.md" ]]; then
+      rm -f "$CONFIG_DIR/prompts/$stale.md"
+      log "  removed (superseded by agent/$stale.md): prompts/$stale.md"
+    fi
+  done
 }
 
 verify() {
@@ -519,18 +564,19 @@ verify() {
     if [[ $INSTALL_SOLO -eq 1 ]] && [[ $INSTALL_AUTO -eq 1 ]]; then
       log "Next steps: run 'opencode', press Tab until the 'solo' agent (default"
       log "workhorse) or 'auto' (orchestrator for big tasks) is selected, and give"
-      log "it a task. Subagents: @coder, @coder2, @researcher, @debugger."
+      log "it a task."
     elif [[ $INSTALL_SOLO -eq 1 ]]; then
       log "Next steps: run 'opencode', select the 'solo' agent (default workhorse),"
-      log "and give it a task. Subagent: @debugger."
+      log "and give it a task. It delegates validation to @debugger."
     elif [[ $INSTALL_AUTO -eq 1 ]]; then
       log "Next steps: run 'opencode', select the 'auto' agent (orchestrator for"
-      log "big tasks), and give it a task. Subagents: @coder, @coder2, @researcher"
-      log "(debugger only when needed)."
+      log "big tasks), and give it a task."
     else
       log "Next steps: run 'opencode' with the built-in agents (build, plan)."
-      log "Install solo/auto later to get full functionality."
+      log "Install solo/auto later for their orchestration workflows."
     fi
+    log "Subagents @coder, @coder2, @researcher and @debugger are always"
+    log "installed (agent/*.md) and taskable from any primary."
     log "Force-refresh the weekly model cache with /reload_models."
   else
     {

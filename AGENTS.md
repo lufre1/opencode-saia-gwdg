@@ -10,11 +10,12 @@ The repo mirrors the installed `~/.config/opencode` layout using opencode's auto
 
 | File / dir | Purpose |
 |------------|---------|
-| `opencode.jsonc` | Main config: provider + inline agent definitions (plugin & commands are auto-discovered from their folders — no `plugin`/`command` entries) |
+| `opencode.jsonc` | Main config: provider + the two optional **primary** agents (`solo`, `auto`) and model-pinning stubs for `plan`/`build`/`general`/`explore` (plugin, commands & subagents are auto-discovered from their folders — no `plugin`/`command` entries) |
 | `plugin/saia-gwdg-plugin.js` | Runtime plugin (auto-discovered): live model list, request pacer (incl. reasoning-effort injection), budget tracking, prompt injection |
 | `command/*.md` | Slash commands `/usage`, `/reload_models`, `/effort` (auto-discovered) |
 | `scripts/{usage,reload-models,effort}.sh` | Backing shell scripts the commands invoke (referenced by absolute path) |
-| `prompts/` | Agent system prompts, via `{file:./prompts/*.md}`; the plugin also reads `../prompts/{auto,solo}.md` for budget injection |
+| `agent/*.md` | The four **subagents** — frontmatter (same schema as an `opencode.jsonc` agent block) + prompt body in one file; auto-discovered by opencode from `{agent,agents}/**/*.md`, so they install unconditionally and are never touched by the installer's agent filter |
+| `prompts/` | System prompts for the two optional primaries only (`auto.md`, `solo.md`), via `{file:./prompts/*.md}`; the plugin also reads `../prompts/{auto,solo}.md` for budget injection. Subagent prompts are the bodies of their `agent/*.md` |
 | `tool/`, `skill/` | Scaffolds (with READMEs) for future opencode custom tools / skills |
 | `yagni.md` | Global instruction appended to every agent (via `instructions`) |
 | `auth.json` (in `~/.local/share/opencode/`) | Stores API key (chmod 600) |
@@ -30,18 +31,18 @@ The repo mirrors the installed `~/.config/opencode` layout using opencode's auto
 | `plan` | Primary | global/model | default | - | Ask (edit/bash) | built-in |
 | `general` | Subagent (native) | deepseek-v4-flash | default | - | built-in | built-in |
 | `explore` | Subagent (native) | qwen3-coder-next | default | - | built-in (read-only) | built-in |
-| `solo` | Primary | qwen3-coder-next | 0.2 | 25 | Full + task (debugger only, `*` denied); `skill`, `todowrite`, `webfetch` disabled | `prompts/solo.md` |
-| `auto` | Primary | qwen3.5-122b-a10b | 0.2 | 10 | Read-only (read/glob/grep/list) + task (researcher/coder/coder2/debugger, `*` denied); `skill`, `todowrite`, `webfetch` disabled | `prompts/auto.md` |
-| `coder` | Subagent | qwen3-coder-next | 0.2 | 20 | Full; `skill` disabled | `prompts/coder.md` |
-| `coder2` | Subagent | glm-4.7 | 0.2 | 20 | Full; `skill` disabled | `prompts/coder.md` |
-| `researcher` | Subagent | qwen3.5-122b-a10b | 0.2 | 8 | Read-only; `skill`, `webfetch` disabled | `prompts/researcher.md` |
-| `debugger` | Subagent | qwen3-coder-next | 0.1 | 8 | Full; `skill`, `todowrite`, `webfetch` disabled | `prompts/debugger.md` |
+| `solo` | Primary (optional) | qwen3-coder-next | 0.2 | 25 | Full + task deny-by-exception (`*` denied, `debugger` allowed); `skill`, `todowrite`, `webfetch` disabled | `prompts/solo.md` |
+| `auto` | Primary (optional) | qwen3.5-122b-a10b | 0.2 | 10 | Read-only (read/glob/grep/list) + task allow-by-exception (`*` allowed, `general`/`explore` denied); `skill`, `todowrite`, `webfetch` disabled | `prompts/auto.md` |
+| `coder` | Subagent | qwen3-coder-next | 0.2 | 20 | Full; `skill` disabled | `agent/coder.md` |
+| `coder2` | Subagent | glm-4.7 | 0.2 | 20 | Full; `skill` disabled | `agent/coder2.md` (body replaced with `coder`'s by the plugin) |
+| `researcher` | Subagent | qwen3.5-122b-a10b | 0.2 | 8 | Read-only; `skill`, `webfetch` disabled | `agent/researcher.md` |
+| `debugger` | Subagent | qwen3-coder-next | 0.1 | 8 | Full; `skill`, `todowrite`, `webfetch` disabled | `agent/debugger.md` |
 
 ### Usage
 
 - **Primary agents** (`build`, `plan`, `solo`, `auto`): Press `Tab` to switch
 - **`solo` is the default workhorse** (~5-12 requests/task): one full-context session that plans, implements, self-checks, then tasks `@debugger` for independent validation. Use `auto` only for big/ambiguous multi-file tasks where deep upfront planning (397b researcher) is worth the chain's ~40% coordination overhead (~20-40 requests/task)
-- **Subagents** (`coder`, `coder2`, `researcher`, `debugger`): Invoke with `@coder`, `@coder2`, `@researcher`, or `@debugger` in your message; `coder2` (different model family) exists for fix rounds
+- **Subagents** (`coder`, `coder2`, `researcher`, `debugger`): Invoke with `@coder`, `@coder2`, `@researcher`, or `@debugger` in your message; `coder2` (different model family) exists for fix rounds. They are defined in `agent/*.md`, install unconditionally, and are taskable from any primary that does not deny them — including the built-in `build` agent, since opencode's native ruleset allows `task` by default. Adding a subagent means adding one `agent/<name>.md` plus a `ROLE_MODELS` entry — no primary needs editing
 
 ### Auto Mode Workflow
 
@@ -67,7 +68,8 @@ When you press `Tab` to select `auto` and give it a task, it runs a 5-phase loop
 - **Reasoning effort** (`/effort`, backed by `scripts/effort.sh`): the pacer injects `chat_template_kwargs: { enable_thinking, reasoning_effort }` into the JSON body of `/v1/chat/completions` requests for **reasoning-capable models only** (those whose output advertises `thought`, plus the plugin's `FORCE_REASONING` override set — see above). The key is `enable_thinking`, the Qwen/vLLM chat-template variable; a bare `thinking` key is silently ignored by the template, which is why `/effort` was a no-op before 2026-08-28. Levels are remapped per model via `EFFORT_ALIAS` where a chat template disagrees — `qwen3.8-27b` 400s on `high`/`max` and gets `xhigh` instead; the log line shows the remap as `effort=max->xhigh`. The level is read from `~/.config/opencode/effort.json` (default `high` when missing) and re-read per request, so `/effort off|low|medium|high|max` applies to the current session immediately — no restart. The command runs its script via inline `` !`…` `` injection (like `/usage`) — no bash permission needed, works from any agent — and the plugin short-circuits the resulting chat request locally (sentinel line `(local command — handled without a model call)` in `command/effort.md`), so `/effort` costs zero SAIA requests and returns instantly. Non-reasoning models (e.g. `qwen3-coder-next`) are left untouched. Values map: `off` → `thinking:false`; other levels → `thinking:true` + `reasoning_effort`. Verify with `SAIA_PACER_DEBUG=1` (logs `effort=<level> injected for <model>`)
 - Plugin overrides each agent's model via `ROLE_MODELS` in `saia-gwdg-plugin.js`
 - Built-in agents (`build`, `plan`) remain available alongside custom agents
-- Native subagents (`general`, `explore`) are declared as stubs in `opencode.jsonc` and are **never** stripped by the installer's agent filter — so declining both primaries (`solo`/`auto`) still leaves `@general` and `@explore` available (each pinned to a SAIA model via the plugin's `ROLE_MODELS`)
+- Native subagents (`general`, `explore`) are declared as `{}` stubs in `opencode.jsonc` **only** so the plugin's `ROLE_MODELS` can pin them a SAIA model. Never give them an `agent/*.md` file: opencode assigns `prompt = <file body>` unconditionally, so an empty body would replace their built-in system prompts with `""`
+- **The installer's agent filter only ever deletes the two primaries** (`solo`, `auto`) from `opencode.jsonc`. The four SAIA subagents live in `agent/*.md` and are not represented in that file at all, so declining both primaries still yields a complete set of subagents driving the built-in `build`/`plan` agents
 
 ## Commands
 
@@ -83,10 +85,12 @@ opencode providers    # show provider status
 ## Common Mistakes
 
 - Editing `setup-saia-opencode.sh` directly → it is generated; changes are lost on the next `./build-setup.sh`
-- Changing `opencode.jsonc`, `plugin/`, `command/`, `scripts/`, or `prompts/` without rerunning `./build-setup.sh` → installer drifts from the live config
+- Changing `opencode.jsonc`, `plugin/`, `command/`, `scripts/`, `agent/`, or `prompts/` without rerunning `./build-setup.sh` → installer drifts from the live config
 - Re-adding a `plugin` array or `command` block to `opencode.jsonc` → duplicates the auto-discovered plugin/commands (they load from `plugin/` and `command/` on their own)
-- Moving `prompts/` out of the config root, or moving the plugin without updating its `join(dir, "..", "prompts/…")` read → the plugin's budget injection and the `{file:./prompts/*.md}` refs both break
-- Reordering `agent.auto.permission.task` so `"*": "deny"` comes after the named allows → last-match-wins resolution denies all subagents and silently removes the `task` tool from auto
+- Moving `prompts/` or `agent/` out of the config root, or moving the plugin without updating its `join(dir, "..", "prompts/…")` read → the plugin's budget injection, the `{file:./prompts/*.md}` refs, and opencode's `{agent,agents}/**/*.md` scan break. Keep `agent/` flat: the glob is recursive, so `agent/sub/x.md` becomes an agent literally named `sub/x`
+- Omitting `mode: subagent` from an `agent/*.md`, or quoting a numeric `steps`/`temperature` → the first defaults the agent to `mode: "all"` (it shows up in Tab-cycling as a primary); the second is a **fatal** opencode startup error. `build-setup.sh` checks both at build time
+- Expecting `{file:...}` or `@include` to work inside an `agent/*.md` body → opencode substitutes only inside `opencode.json{,c}`. This is why `coder2`'s prompt is cloned from `coder`'s in the plugin's `config` hook rather than referenced
+- Reordering either primary's `permission.task` so the wildcard comes after the named entries → last-match-wins resolution ignores them. `auto` is allow-by-exception (`"*": "allow"` first, then `general`/`explore` denied); `solo` is deny-by-exception (`"*": "deny"` first, then `debugger` allowed). A wildcard placed last in `auto` re-allows the natives; placed last in `solo` it denies everything and silently removes the `task` tool
 - Renaming the `__SAIA_BUDGET_STATUS__` placeholder in `prompts/auto.md` or `prompts/solo.md` (or moving the files) → the plugin's prompt injection silently stops and the budget check degrades to skipped
 - Making an agent read files outside the project (e.g. `~/.cache`) → `external_directory` permission is auto-rejected in non-interactive runs and kills the run at that step
 - Deleting `auth.json` → plugin silently fails, no models loaded
