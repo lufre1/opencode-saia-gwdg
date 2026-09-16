@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit 02a5984-dirty, packed 2026-09-10T06:07:16Z
+# Source: opencode-config commit ec12a93-dirty, packed 2026-09-16T08:51:55Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — always installed, as
@@ -386,6 +386,9 @@ const MODELS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 //   instead of letting opencode retry-spin 429s into drained buckets
 // - on 429, waits for the advertised reset once and retries; a second 429
 //   fails the key over; a 429 on the next key too throws
+// - on 401/403 the key is revoked/expired: drop it from rotation for the
+//   session and retry on the next key, instead of wedging every request
+//   behind a dead key while healthy ones sit unused
 // - aborts after 3 consecutive 5xx responses: SAIA outages return 500s that
 //   still consume the request budget; instead of hard-sticking, we now sleep
 //   30s and retry so transient blips don't require a process restart.
@@ -702,6 +705,9 @@ function installPacer(keys) {
   // Per-key pacer state, keyed by the key string so a refreshed key list
   // keeps what was already learned.
   const stateByKey = new Map();
+  // Keys SAIA rejected with 401/403. Revoked/expired is permanent — no reset
+  // TTL can revive it — so a dead key leaves rotation for the whole session.
+  const deadKeys = new Set();
   const stateFor = (key) => {
     let s = stateByKey.get(key);
     if (!s) {
@@ -727,6 +733,7 @@ function installPacer(keys) {
   // Converts floored remaining counts into exhaustion stamps, then reports
   // whether the key is currently usable.
   const keyUsable = (key) => {
+    if (deadKeys.has(key)) return false;
     const s = stateFor(key);
     let usable = true;
     for (const b of ["hour", "day", "month"]) {
@@ -760,15 +767,21 @@ function installPacer(keys) {
   const allExhaustedError = () => {
     const all = globalThis.__saiaKeys;
     const per = all.map((k) => {
+      if (deadKeys.has(k)) return `${label(k)}: rejected (401/403)`;
       const s = stateFor(k);
       const buckets = ["hour", "day", "month"].filter(
         (b) => s.exhausted[b] && Date.now() - s.exhausted[b] < RESET_TTL_MS[b]
       );
       return `${label(k)}: ${buckets.join("+") || "exhausted"}`;
     });
+    const allDead = all.every((k) => deadKeys.has(k));
     return new Error(
-      `All ${all.length} SAIA key(s) nearly exhausted (${per.join("; ")}) — ` +
-        `aborting instead of retry-spinning. Wait for the buckets to reset.`
+      allDead
+        ? `All ${all.length} SAIA key(s) rejected by SAIA (${per.join("; ")}) — the key(s) are ` +
+          `revoked or expired. Get a new one from https://saia.gwdg.de/ ` +
+          `and update ${join(homedir(), ".local/share/opencode/auth.json")} (extra keys: ${KEYS_PATH}).`
+        : `All ${all.length} SAIA key(s) nearly exhausted (${per.join("; ")}) — ` +
+          `aborting instead of retry-spinning. Wait for the buckets to reset.`
     );
   };
 
@@ -1465,6 +1478,16 @@ function installPacer(keys) {
       };
 
       let resp = await attempt(key);
+      // A revoked/expired key 401s forever. Without this, key #1 going dead
+      // wedges every request behind it while healthy keys sit unused in
+      // rotation, and opencode only ever shows "Unauthorized".
+      while (resp.status === 401 || resp.status === 403) {
+        deadKeys.add(key);
+        pacerDebugLog(`${resp.status} on ${label(key)} — key rejected, dropped from rotation`);
+        key = pickKey();
+        if (key === null) throw allExhaustedError();
+        resp = await attempt(key);
+      }
       if (resp.status === 429) {
         const reset = Number(resp.headers.get("ratelimit-reset")) || 60;
         pacerDebugLog(`429 ${url.pathname} on ${label(key)} — waiting ${Math.min(reset, 65)}s before one retry`);
