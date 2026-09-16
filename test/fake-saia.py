@@ -28,6 +28,9 @@ MODES = {
     "accept-silent": "accept the connection and never send headers",
     "empty-200": "200 + event-stream, no kong headers, no bytes ever",
     "five-hundred": "500 on the first 3 requests of the process, then ok",
+    "accept-silent-then-500": "never send headers on the first 2 requests, then 500 forever",
+    "breaker": "never send headers, on every request forever",
+    "tiered-deadline": "never send headers (alias of accept-silent, asserts the per-try deadlines)",
     "slow-json": "non-streaming: content-type json, half a body, then silence",
 }
 
@@ -37,6 +40,7 @@ MODEL = "fake-model-1"
 STALL_SECONDS = 600  # "forever" as far as any plugin deadline is concerned
 
 _five_hundred_count = 0
+_stall_then_500_count = 0
 
 
 def sse(delta, finish=None, extra=None):
@@ -192,6 +196,31 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": {"message": "Internal Server Error"}}, 500)
         else:
             self._m_ok()
+
+    def _m_accept_silent_then_500(self):
+        # The production sequence the matrix could not previously reproduce:
+        # SAIA hung on tries 1-2 and then answered the LAST try with a 500
+        # (observed 2026-09-09 at 20:46:01, 20:47:35 and 21:11:21). The request
+        # therefore ends on an HTTP response rather than a timeout, so the
+        # pacer must NOT write a transport-fail-marker and must leave the 500
+        # to opencode's own retry.
+        global _stall_then_500_count
+        _stall_then_500_count += 1
+        if _stall_then_500_count <= 2:
+            time.sleep(STALL_SECONDS)
+        else:
+            self._json({"error": {"message": "Internal Server Error"}}, 500)
+
+    def _m_tiered_deadline(self):
+        # Same behaviour as accept-silent; a separate mode only so the matrix
+        # can assert the per-try deadlines under a different env pairing
+        # without disturbing the accept-silent regression row.
+        time.sleep(STALL_SECONDS)
+
+    def _m_breaker(self):
+        # Every request accepted and then left silent, so the model-health
+        # breaker crosses its timeout floor and swaps in a stand-in.
+        time.sleep(STALL_SECONDS)
 
     def _m_slow_json(self):
         self.send_response(200)

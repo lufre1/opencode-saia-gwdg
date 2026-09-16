@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit 07ed8e1-dirty, packed 2026-09-09T20:26:23Z
+# Source: opencode-config commit 02a5984-dirty, packed 2026-09-10T06:07:16Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — always installed, as
@@ -260,7 +260,7 @@ write_file "opencode.jsonc" <<'__OC_FILE_EOF__'
       "mode": "primary",
       "model": "saia-gwdg/qwen3-coder-next",
       "temperature": 0.2,
-      "steps": 25,
+      "steps": 40,
       "prompt": "{file:./prompts/solo.md}",
       "permission": {
         "edit": "allow",
@@ -284,7 +284,7 @@ write_file "opencode.jsonc" <<'__OC_FILE_EOF__'
       "mode": "primary",
       "model": "saia-gwdg/qwen3.5-122b-a10b",
       "temperature": 0.2,
-      "steps": 10,
+      "steps": 25,
       "prompt": "{file:./prompts/auto.md}",
       "permission": {
         "read": "allow",
@@ -419,6 +419,20 @@ const MAX_CONSECUTIVE_5XX = 3;
 // Floor 5s: a sub-second value can only be a leftover test export, and it
 // kills every request. Edit the constant directly for fault-injection tests.
 const TIMEOUT_MS = Math.max(Number(process.env.SAIA_TIMEOUT_MS) || 45_000, 5_000);
+// Headers deadline for every try EXCEPT the last. Measured over 1697 successful
+// completions the TTFB distribution is p50 2.1s / p90 7.3s / p99 25.5s, and no
+// request that ran past 45s ever went on to deliver headers — a hang is dead,
+// not slow. Spending the full TIMEOUT_MS on all three tries cost 3x45s = 135s
+// before a turn even failed (confirmed against opencode's own message record:
+// created -> completed = 135.5s). Early tries now reconnect quickly — a fresh
+// connection is re-load-balanced onto another replica, which is what actually
+// recovers — while the LAST try keeps the full budget so a genuinely
+// slow-but-alive replica still gets its chance. Worst case 135s -> 85s.
+// SILENT_PACED_MODELS are exempt (see below): they are legitimately slow.
+const EARLY_TIMEOUT_MS = Math.min(
+  Math.max(Number(process.env.SAIA_EARLY_TIMEOUT_MS) || 20_000, 5_000),
+  TIMEOUT_MS
+);
 // Connection attempts per request (1 = no reconnect). Only connection-level
 // failures are retried here; 5xx and 429 are opencode's job.
 const MAX_CONNECT_TRIES = 3;
@@ -426,6 +440,26 @@ const MAX_CONNECT_TRIES = 3;
 // A short backoff between retries lets the replica pool recover a healthy node.
 const SILENT_PACED_MODELS = new Set(["deepseek-v4-flash-0731", "qwen3.8-27b"]);
 const RETRY_BACKOFF_MS = 5_000;
+// Model-health breaker. A SAIA model can enter a state where it accepts the
+// connection and then never sends headers, and reconnecting does not help
+// because the model is sick, not the replica. Observed 2026-09-09:
+// glm-5.3-flash returned 20 headers-timeouts against 9 successes over 38
+// requests (53%) while qwen3-coder-next — same gateway, same key, same minutes
+// — had zero. The only useful move is to stop sending that model traffic.
+// Tripped on a RATIO with a floor on the sample, so a healthy-but-busy model
+// cannot trip on one unlucky request: against the observed data glm-5.3-flash
+// (0.69) trips on its 4th timeout, ~3.5min in, while qwen3-coder-next never does.
+const MODEL_HEALTH_WINDOW_MS = 10 * 60_000;
+const MODEL_BREAKER_MIN_TIMEOUTS = Math.max(
+  Number(process.env.SAIA_BREAKER_MIN_TIMEOUTS) || 4,
+  1
+);
+const MODEL_BREAKER_RATIO = 0.5;
+const MODEL_BREAKER_COOLDOWN_MS = 15 * 60_000;
+// Stand-in when the failing model belongs to no ROLE_MODELS list — which is
+// exactly how the 2026-09-09 outage happened, glm-5.3-flash having been picked
+// by hand in the TUI model switcher. Best measured record in the whole log.
+const BREAKER_FALLBACK_MODEL = "qwen3-coder-next";
 // Stream idle timeout: if no data arrives within this window after headers, treat as a stall and retry.
 // Reuse TIMEOUT_MS so there's only one knob to tune for all timeouts.
 const STREAM_IDLE_TIMEOUT_MS = TIMEOUT_MS;
@@ -448,8 +482,14 @@ const RESUME_ANCHOR_CHARS = 1_500;
 // non-streaming ones had no guard at all once the headers deadline stopped
 // spanning the body, so they get their own clock here.
 const BODY_TIMEOUT_MS = Math.max(Number(process.env.SAIA_BODY_TIMEOUT_MS) || 60_000, 5_000);
-const PACER_LOG = join(homedir(), ".cache/opencode/saia-gwdg-pacer.log");
-const BUDGET_PATH = join(homedir(), ".cache/opencode/saia-gwdg-budget.json");
+// Overridable so test/run-faults.sh can get a private log and budget file.
+// Without that the matrix reads a log another live opencode is writing to
+// at the same time, and its "pacer delta" picks up that session's real
+// requests — which is exactly what happened on the first run of the
+// tiered-deadline case.
+const PACER_LOG = process.env.SAIA_PACER_LOG || join(homedir(), ".cache/opencode/saia-gwdg-pacer.log");
+const BUDGET_PATH =
+  process.env.SAIA_BUDGET_PATH || join(homedir(), ".cache/opencode/saia-gwdg-budget.json");
 const KEYS_PATH = join(homedir(), ".local/share/opencode/saia-gwdg-keys.json");
 // Reasoning-effort state, written by /effort (scripts/effort.sh). The pacer
 // re-reads it per request so a change applies to the CURRENT session without a
@@ -485,6 +525,125 @@ const pacerDebugLog = (line) => {
 const markTransportFail = (msg) => {
   globalThis.__saiaLastTransportFail = { at: Date.now(), msg: String(msg).slice(0, 300) };
   pacerDebugLog(`transport-fail-marker ${String(msg).replace(/\s+/g, " ").slice(0, 160)}`);
+};
+
+// Pushes a one-line notice into the TUI. The pacer runs with no `client` (and
+// in `opencode run` there is no TUI at all), so the real implementation is
+// installed by the server hook below and every call site tolerates its absence.
+const saiaToast = (message, variant = "warning") => {
+  try {
+    globalThis.__saiaToast?.(message, variant);
+  } catch {}
+};
+
+// ----------------------------------------------------------- model health
+// State for the breaker described at MODEL_HEALTH_WINDOW_MS. One entry per
+// model id, holding rolling timestamp arrays plus the current trip.
+const modelHealth = new Map();
+
+const pruneHealth = (arr, now) => {
+  while (arr.length && now - arr[0] > MODEL_HEALTH_WINDOW_MS) arr.shift();
+  return arr;
+};
+
+const healthFor = (model) => {
+  let h = modelHealth.get(model);
+  if (!h) {
+    h = { timeouts: [], successes: [], trippedAt: 0, trippedCount: 0, replacement: null, notified: false };
+    modelHealth.set(model, h);
+  }
+  return h;
+};
+
+// Reverse index model -> role, built lazily on first use: ROLE_MODELS is
+// declared further down this file and is still in the TDZ while this module is
+// being evaluated.
+let roleByModel = null;
+const roleOf = (model) => {
+  if (!roleByModel) {
+    roleByModel = new Map();
+    for (const [role, list] of Object.entries(ROLE_MODELS)) {
+      for (const m of list) if (!roleByModel.has(m)) roleByModel.set(m, role);
+    }
+  }
+  return roleByModel.get(model) ?? null;
+};
+
+const isTripped = (model, now) => {
+  const h = modelHealth.get(model);
+  return !!h?.trippedAt && now - h.trippedAt < MODEL_BREAKER_COOLDOWN_MS;
+};
+
+// Next entry in the failing model's own role list, else the global fallback.
+// Never returns a model that is itself tripped.
+const pickReplacement = (model, now) => {
+  const role = roleOf(model);
+  const candidates = role ? ROLE_MODELS[role].filter((m) => m !== model) : [];
+  candidates.push(BREAKER_FALLBACK_MODEL);
+  for (const c of candidates) if (c !== model && !isTripped(c, now)) return c;
+  return null;
+};
+
+// The model to actually put on the wire in place of `model`. Once the cooldown
+// lapses this returns `model` again, which is the probe: one request goes back
+// to the original, and recordModelTimeout re-trips instantly if it hangs.
+const effectiveModelFor = (model) => {
+  const now = Date.now();
+  if (!model || !isTripped(model, now)) return model;
+  const h = modelHealth.get(model);
+  // If the stand-in has since gone bad too, pick another rather than flapping
+  // back onto the model we already know is hanging.
+  if (!h.replacement || isTripped(h.replacement, now)) {
+    const next = pickReplacement(model, now);
+    if (!next) return model;
+    h.replacement = next;
+    h.notified = false;
+  }
+  return h.replacement;
+};
+
+// Records one headers-timeout. Trips when the model has crossed both the sample
+// floor and the failure ratio. A model that has tripped before needs only a
+// single timeout to trip again, so the post-cooldown probe fails fast instead of
+// having to re-earn the full sample.
+const recordModelTimeout = (model) => {
+  if (!model) return;
+  const now = Date.now();
+  const h = healthFor(model);
+  pruneHealth(h.timeouts, now).push(now);
+  pruneHealth(h.successes, now);
+  if (isTripped(model, now)) return;
+  const total = h.timeouts.length + h.successes.length;
+  const floor = h.trippedCount > 0 ? 1 : MODEL_BREAKER_MIN_TIMEOUTS;
+  if (h.timeouts.length < floor) return;
+  if (h.timeouts.length / total < MODEL_BREAKER_RATIO) return;
+  h.trippedAt = now;
+  h.trippedCount += 1;
+  h.replacement = pickReplacement(model, now);
+  h.notified = false;
+  pacerDebugLog(
+    h.replacement
+      ? `model-unhealthy ${model} -> ${h.replacement} ` +
+          `(${h.timeouts.length} timeouts / ${total} reqs in ${MODEL_HEALTH_WINDOW_MS / 60000}min)`
+      : `model-unhealthy ${model} — no healthy stand-in available, staying on it ` +
+          `(${h.timeouts.length} timeouts / ${total} reqs)`
+  );
+};
+
+const recordModelSuccess = (model) => {
+  if (!model) return;
+  const now = Date.now();
+  const h = healthFor(model);
+  pruneHealth(h.timeouts, now);
+  pruneHealth(h.successes, now).push(now);
+  // A success once the cooldown has lapsed means the probe got through: clear
+  // the trip so traffic returns to the model the user actually chose.
+  if (h.trippedAt && now - h.trippedAt >= MODEL_BREAKER_COOLDOWN_MS) {
+    h.trippedAt = 0;
+    h.replacement = null;
+    h.notified = false;
+    pacerDebugLog(`model-recovered ${model} — breaker cleared`);
+  }
 };
 
 function installPacer(keys) {
@@ -816,6 +975,41 @@ function installPacer(keys) {
         consecutive5xx = 0;
         pacerDebugLog("cooldown: done, resuming queue");
       }
+
+      // Model-health breaker: if this model has been failing to send headers,
+      // put a healthy stand-in on the wire instead. Rebinding `init` and
+      // `model` here rather than deeper means every downstream consumer — the
+      // req/resp/fail log lines, SILENT_PACED_MODELS, pickIdleTimeout and
+      // wrapStreamWithRetry — follows the model actually being requested.
+      //
+      // Trade-off, accepted deliberately: opencode's UI and its token/cost
+      // accounting still show the model the user selected. The toast is what
+      // tells them. This is a stopgap that keeps a session alive during a
+      // provider-side outage, not a silent permanent substitution.
+      //
+      // Idempotent: once `model` is the stand-in, effectiveModelFor returns it
+      // unchanged. Called both here and at the top of every connect try, so a
+      // breaker that trips *between* tries re-routes the remaining try instead
+      // of spending the full last-try budget on a model already known to hang.
+      const applyBreaker = () => {
+        const substitute = effectiveModelFor(model);
+        if (!substitute || substitute === model) return;
+        try {
+          const parsed = JSON.parse(init?.body);
+          init = { ...init, body: JSON.stringify({ ...parsed, model: substitute }) };
+          const h = modelHealth.get(model);
+          if (h && !h.notified) {
+            h.notified = true;
+            saiaToast(`SAIA: ${model} is not responding — using ${substitute} for now`);
+          }
+          pacerDebugLog(`model-substitute ${model} -> ${substitute} id=${reqId}`);
+          model = substitute;
+        } catch {
+          // Unparseable body: leave the request exactly as opencode built it.
+        }
+      };
+      applyBreaker();
+
       let key = pickKey();
       if (key === null) throw allExhaustedError();
 
@@ -871,7 +1065,10 @@ function installPacer(keys) {
         if (wait > 0) await sleep(wait);
         lastStart = Date.now();
         const reasoningModels = globalThis.__saiaReasoning ?? new Set();
-        const effInit = withEffort(input, continuationInit(continuation), url, reasoningModels);
+        // Rebuilt per try (below) rather than once: applyBreaker() can rebind
+        // `init` between tries, and effInit has to be derived from the current
+        // one or the swap would never reach the wire.
+        let effInit;
         // One reconnect on a connection-level failure. opencode retries 5xx and
         // 429 for us, but the AI SDK classifies an abort as user cancellation,
         // so a timed-out or dropped connection gets exactly one shot and
@@ -879,6 +1076,8 @@ function installPacer(keys) {
         // fresh connection is re-load-balanced — so retrying here is what
         // actually recovers. The caller's own abort is never retried.
         for (let tryNo = 1; ; tryNo++) {
+          applyBreaker();
+          effInit = withEffort(input, continuationInit(continuation), url, reasoningModels);
           // The deadline wraps only the network call, so queue wait, 2100ms
           // spacing, the 30s cooldown and the 429 sleeps can't trigger a false
           // abort. AbortSignal.any keeps opencode's own cancellation working.
@@ -891,12 +1090,22 @@ function installPacer(keys) {
           // (non-streaming). An explicit controller held in a local also avoids
           // relying on how the runtime keeps an AbortSignal.timeout reachable
           // through an AbortSignal.any composite alive.
+          // Early tries get the short deadline and reconnect; the last try
+          // gets the full budget. Only the last try's error is ever thrown, so
+          // what reaches opencode still reads "within 45000ms" at the default
+          // TIMEOUT_MS and the RESUMABLE_PATTERNS matcher is untouched.
+          // Silent-paced models are exempt: they are legitimately slow to
+          // first byte.
+          const deadline =
+            SILENT_PACED_MODELS.has(model) || tryNo >= MAX_CONNECT_TRIES
+              ? TIMEOUT_MS
+              : EARLY_TIMEOUT_MS;
           const headerCtl = new AbortController();
           const headerTimer = setTimeout(() => {
             headerCtl.abort(
-              new DOMException(`SAIA headers not received within ${TIMEOUT_MS}ms`, "TimeoutError")
+              new DOMException(`SAIA headers not received within ${deadline}ms`, "TimeoutError")
             );
-          }, TIMEOUT_MS);
+          }, deadline);
           headerTimer.unref?.();
           const signal = effInit?.signal
             ? AbortSignal.any([effInit.signal, headerCtl.signal])
@@ -914,9 +1123,13 @@ function installPacer(keys) {
             const retrying = !effInit?.signal?.aborted && tryNo < MAX_CONNECT_TRIES;
             pacerDebugLog(
               `fail ${e?.name ?? "Error"} ${url.pathname} model=${model} ${label(k)} id=${reqId} try=${tryNo} ` +
-                `after=${Date.now() - startedAt}ms timeout=${TIMEOUT_MS}ms retrying=${retrying} ` +
+                `after=${Date.now() - startedAt}ms timeout=${deadline}ms retrying=${retrying} ` +
                 `msg=${String(e?.message ?? e).replace(/\s+/g, " ").slice(0, 200)}`
             );
+            // Feed the model-health breaker. Counted on EVERY try, not just
+            // the final give-up: give-ups alone were 25 minutes apart in the
+            // 2026-09-09 outage, far too slow to route around.
+            if (e?.name === "TimeoutError" && !effInit?.signal?.aborted) recordModelTimeout(model);
             if (retrying) {
               if (SILENT_PACED_MODELS.has(model)) {
                 await sleep(RETRY_BACKOFF_MS);
@@ -939,6 +1152,7 @@ function installPacer(keys) {
           const ttfb = Date.now() - startedAt;
           readBuckets(resp, k);
           consecutive5xx = resp.status >= 500 ? consecutive5xx + 1 : 0;
+          if (resp.status < 500) recordModelSuccess(model);
           const s = stateFor(k);
           // kong id is emitted on every response, not just failures: GWDG needs a
           // healthy baseline to diff a bad request against.
@@ -1510,6 +1724,15 @@ export const server = async (input) => {
   const directory = input?.directory;
   const dirQuery = directory ? { directory } : undefined;
   const resumeEnabled = AUTO_RESUME && !!client;
+  // Back the saiaToast() shim with the real TUI route. /tui/show-toast exists
+  // in opencode 1.17.18; guarded anyway because `opencode run` has no TUI
+  // attached and older builds may not expose the method. A failed notice must
+  // never take down the resume or the request it is describing.
+  globalThis.__saiaToast = (message, variant = "warning") => {
+    try {
+      client?.tui?.showToast?.({ body: { message, variant } })?.catch?.(() => {});
+    } catch {}
+  };
   pacerDebugLog(
     resumeEnabled
       ? `auto-resume: armed (max ${MAX_AUTO_RESUMES}/session, ${MAX_RESUMES_PER_HOUR}/hour, backoff ${RESUME_BACKOFF_MS.join("/")}ms)`
@@ -1642,6 +1865,10 @@ export const server = async (input) => {
         `auto-resume fired session=${sessionID} attempt=${s.attempts}/${MAX_AUTO_RESUMES} ` +
           `agent=${hint?.agent ?? "-"} model=${hint?.model?.modelID ?? "-"} why=${why}`
       );
+      // opencode stamps the transport error permanently onto the failed
+      // message, and the resume arrives as a synthetic user part with nothing
+      // linking the two — so without this the turn just looks dead.
+      saiaToast(`SAIA auto-resume ${s.attempts}/${MAX_AUTO_RESUMES} — ${why}`);
     } catch (e) {
       // Do not re-schedule here: the next genuine error event will.
       s.awaitingSelfMessage = 0;
@@ -1993,6 +2220,10 @@ export const server = async (input) => {
             );
           }
         } catch (e) {
+          // An install without --solo (or without --auto) simply has no such
+          // file. That is a supported configuration, not a failure, and logging
+          // it as one on every config-hook run is pure noise.
+          if (e?.code === "ENOENT") continue;
           pacerDebugLog(`budget-status injection failed for ${role}: ${e.message}`);
         }
       }
@@ -2341,7 +2572,7 @@ description: Fix-round implementer on a different model family (breaks correlate
 mode: subagent
 model: saia-gwdg/glm-4.7
 temperature: 0.2
-steps: 20
+steps: 35
 permission:
   edit: allow
   bash: allow
@@ -2369,7 +2600,7 @@ description: "Implementation agent: executes an audited PLAN, returns CHANGES bl
 mode: subagent
 model: saia-gwdg/qwen3-coder-next
 temperature: 0.2
-steps: 20
+steps: 35
 permission:
   edit: allow
   bash: allow
@@ -2418,7 +2649,7 @@ description: "Validator: runs acceptance criteria, returns VERDICT PASS/FAIL wit
 mode: subagent
 model: saia-gwdg/qwen3-coder-next
 temperature: 0.1
-steps: 8
+steps: 15
 permission:
   edit: allow
   bash: allow
@@ -2474,7 +2705,7 @@ description: "Read-only analyst: produces PLAN blocks with runnable acceptance c
 mode: subagent
 model: saia-gwdg/qwen3.5-122b-a10b
 temperature: 0.2
-steps: 8
+steps: 15
 permission:
   edit: deny
   bash: deny

@@ -10,11 +10,17 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-LOG="$HOME/.cache/opencode/saia-gwdg-pacer.log"
 LIVE_PLUGIN="$HOME/.config/opencode/plugin/saia-gwdg-plugin.js"
 OC="$HOME/.opencode/bin/opencode"
 PORT="${FAKE_SAIA_PORT:-8787}"
 WORK="$(mktemp -d)"
+WORK_LOG="$WORK/pacer.log"
+WORK_BUDGET="$WORK/budget.json"
+touch "$WORK_LOG"
+# Private to this run: a live opencode session writes to the shared pacer log
+# continuously, and its real SAIA responses would otherwise land in the
+# per-mode delta and satisfy (or break) assertions by accident.
+LOG="$WORK_LOG"
 # Any model id in the cache; the fake endpoint ignores it. Must NOT be one of
 # SILENT_PACED_MODELS, whose 90s idle window would stretch every stall case.
 MODEL="${FAULT_MODEL:-saia-gwdg/qwen3-coder-next}"
@@ -36,32 +42,42 @@ start_server() { # $1 = mode
 }
 stop_server() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""; }
 
-# mode|SAIA_TIMEOUT_MS|seconds to allow|expected pacer-log regexes (\t separated)
+# mode|SAIA_TIMEOUT_MS|SAIA_EARLY_TIMEOUT_MS|SAIA_BREAKER_MIN_TIMEOUTS|seconds|checks (\t separated)
+# The early timeout is clamped to SAIA_TIMEOUT_MS by the plugin, so passing the
+# same value in both columns reproduces the old flat-deadline behaviour and
+# leaves the pre-existing rows asserting exactly what they always did.
 CASES=$(cat <<'TABLE'
-ok|45000|60|stream-done
-slow|45000|150|stream-done .*total=[6-9][0-9]{4}ms	!stream-fail	!stream-error
-headers-stall|5000|120|stream-stall	stream-retry .*anchor=[1-9]	stream-error .*retryable=true
-headers-stall-long|5000|150|stream-retry .*truncated=true	!stream-truncated
-headers-stall-toolcall|5000|150|stream-toolcall-abandon	auto-resume scheduled	!stream-retry
-late-error|5000|60|stream-late-error-ignored	!stream-fail
-accept-silent|5000|120|fail TimeoutError .*retrying=true	fail TimeoutError .*retrying=false
-empty-200|45000|120|stream-stall .*timeout=10000ms
-five-hundred|5000|120|resp 500
-slow-json|5000|120|body-fail TimeoutError
+ok|45000|45000|4|60|stream-done
+slow|45000|45000|4|150|stream-done .*total=[6-9][0-9]{4}ms	!stream-fail	!stream-error
+headers-stall|5000|5000|4|120|stream-stall	stream-retry .*anchor=[1-9]	stream-error .*retryable=true
+headers-stall-long|5000|5000|4|150|stream-retry .*truncated=true	!stream-truncated
+headers-stall-toolcall|5000|5000|4|150|stream-toolcall-abandon	auto-resume scheduled	!stream-retry
+late-error|5000|5000|4|60|stream-late-error-ignored	!stream-fail
+accept-silent|5000|5000|4|120|fail TimeoutError .*retrying=true	fail TimeoutError .*retrying=false	transport-fail-marker
+empty-200|45000|45000|4|120|stream-stall .*timeout=10000ms
+five-hundred|5000|5000|4|120|resp 500
+slow-json|5000|5000|4|120|body-fail TimeoutError
+tiered-deadline|15000|5000|99|150|fail TimeoutError .*try=1 .*timeout=5000ms	fail TimeoutError .*try=3 .*timeout=15000ms	!try=1 .*timeout=15000ms
+accept-silent-then-500|15000|5000|99|150|fail TimeoutError .*timeout=5000ms .*retrying=true	resp 500	!transport-fail-marker
+breaker|15000|5000|2|180|model-unhealthy qwen3-coder-next	model-substitute qwen3-coder-next -> glm-4.7	req .*model=glm-4.7
 TABLE
 )
 
 want_modes=("$@")
 run_mode() {
-  local mode="$1" timeout_ms="$2" secs="$3" checks="$4"
+  local mode="$1" timeout_ms="$2" early_ms="$3" breaker_min="$4" secs="$5" checks="$6"
   local start_line
   start_line=$(wc -l < "$LOG")
-  echo "=== $mode (SAIA_TIMEOUT_MS=$timeout_ms, allow ${secs}s)"
+  echo "=== $mode (SAIA_TIMEOUT_MS=$timeout_ms early=$early_ms breaker_min=$breaker_min, allow ${secs}s)"
   start_server "$mode" || { fail=$((fail+1)); return; }
   ( cd "$WORK" && \
     SAIA_TEST_HOST=127.0.0.1 \
     SAIA_BASE_URL="http://127.0.0.1:$PORT/v1" \
+    SAIA_PACER_LOG="$WORK_LOG" \
+    SAIA_BUDGET_PATH="$WORK_BUDGET" \
     SAIA_TIMEOUT_MS="$timeout_ms" \
+    SAIA_EARLY_TIMEOUT_MS="$early_ms" \
+    SAIA_BREAKER_MIN_TIMEOUTS="$breaker_min" \
     timeout "$secs" "$OC" run -m "$MODEL" --agent build "reply with the single word hi" \
     >"$WORK/$mode.out" 2>&1 </dev/null )
   stop_server
@@ -81,14 +97,14 @@ run_mode() {
   if [ "$ok" = 1 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "  --- pacer delta ---"; sed 's/^/  | /' "$delta" | tail -25; fi
 }
 
-while IFS='|' read -r mode tmo secs checks <&3; do
+while IFS='|' read -r mode tmo early bmin secs checks <&3; do
   [ -z "$mode" ] && continue
   if [ ${#want_modes[@]} -gt 0 ]; then
     match=0
     for w in "${want_modes[@]}"; do [ "$w" = "$mode" ] && match=1; done
     [ "$match" = 1 ] || continue
   fi
-  run_mode "$mode" "$tmo" "$secs" "$checks"
+  run_mode "$mode" "$tmo" "$early" "$bmin" "$secs" "$checks"
 done 3<<< "$CASES"
 
 echo
