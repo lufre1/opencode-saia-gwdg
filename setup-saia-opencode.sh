@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit ec12a93-dirty, packed 2026-09-16T08:51:55Z
+# Source: opencode-config commit 0441adc-dirty, packed 2026-09-16T12:32:04Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — always installed, as
@@ -260,7 +260,7 @@ write_file "opencode.jsonc" <<'__OC_FILE_EOF__'
       "mode": "primary",
       "model": "saia-gwdg/qwen3-coder-next",
       "temperature": 0.2,
-      "steps": 40,
+      "steps": 60,
       "prompt": "{file:./prompts/solo.md}",
       "permission": {
         "edit": "allow",
@@ -284,7 +284,7 @@ write_file "opencode.jsonc" <<'__OC_FILE_EOF__'
       "mode": "primary",
       "model": "saia-gwdg/qwen3.5-122b-a10b",
       "temperature": 0.2,
-      "steps": 25,
+      "steps": 40,
       "prompt": "{file:./prompts/auto.md}",
       "permission": {
         "read": "allow",
@@ -2595,7 +2595,7 @@ description: Fix-round implementer on a different model family (breaks correlate
 mode: subagent
 model: saia-gwdg/glm-4.7
 temperature: 0.2
-steps: 35
+steps: 60
 permission:
   edit: allow
   bash: allow
@@ -2623,7 +2623,7 @@ description: "Implementation agent: executes an audited PLAN, returns CHANGES bl
 mode: subagent
 model: saia-gwdg/qwen3-coder-next
 temperature: 0.2
-steps: 35
+steps: 60
 permission:
   edit: allow
   bash: allow
@@ -2672,7 +2672,7 @@ description: "Validator: runs acceptance criteria, returns VERDICT PASS/FAIL wit
 mode: subagent
 model: saia-gwdg/qwen3-coder-next
 temperature: 0.1
-steps: 15
+steps: 25
 permission:
   edit: allow
   bash: allow
@@ -2728,7 +2728,7 @@ description: "Read-only analyst: produces PLAN blocks with runnable acceptance c
 mode: subagent
 model: saia-gwdg/qwen3.5-122b-a10b
 temperature: 0.2
-steps: 15
+steps: 25
 permission:
   edit: deny
   bash: deny

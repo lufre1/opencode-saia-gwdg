@@ -3,7 +3,7 @@ description: "Validator: runs acceptance criteria, returns VERDICT PASS/FAIL wit
 mode: subagent
 model: saia-gwdg/qwen3-coder-next
 temperature: 0.1
-steps: 15
+steps: 25
 permission:
   edit: allow
   bash: allow

@@ -3,7 +3,7 @@ description: "Implementation agent: executes an audited PLAN, returns CHANGES bl
 mode: subagent
 model: saia-gwdg/qwen3-coder-next
 temperature: 0.2
-steps: 35
+steps: 60
 permission:
   edit: allow
   bash: allow

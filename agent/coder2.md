@@ -3,7 +3,7 @@ description: Fix-round implementer on a different model family (breaks correlate
 mode: subagent
 model: saia-gwdg/glm-4.7
 temperature: 0.2
-steps: 35
+steps: 60
 permission:
   edit: allow
   bash: allow

@@ -3,7 +3,7 @@ description: "Read-only analyst: produces PLAN blocks with runnable acceptance c
 mode: subagent
 model: saia-gwdg/qwen3.5-122b-a10b
 temperature: 0.2
-steps: 15
+steps: 25
 permission:
   edit: deny
   bash: deny
