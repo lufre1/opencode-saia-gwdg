@@ -53,7 +53,7 @@ When you press `Tab` to select `auto` and give it a task, it runs a 5-phase loop
 4. **Validate** — `@debugger` actually RUNS every acceptance criterion (batched into one script where possible) and returns VERDICT: PASS/FAIL with quoted command output
 5. **Fix loop** — on FAIL, auto tasks `@coder2` (a different model family than the first coder, to avoid repeating the same mistake) with the failures verbatim and re-validates, max 1 round; then it must report failure honestly. If a subagent errors or omits its required block, auto retries that same agent once, then reports failure — it never substitutes another agent type
 
-**Auto mode cannot edit, write, or run bash** — it delegates all work. It may declare success only when the debugger returned `VERDICT: PASS` with real command output for every criterion; otherwise it reports the remaining failures verbatim.
+**Auto mode cannot edit, write, or mutate bash** — it may use read-only bash (`ls`, `git status/diff/log`, `rg`, `cat`, `wc`, `find`, etc.) for inspection, but delegates implementation to subagents. It may declare success only when the debugger returned `VERDICT: PASS` with real command output for every criterion; otherwise it reports the remaining failures verbatim.
 
 ## Key Facts
 

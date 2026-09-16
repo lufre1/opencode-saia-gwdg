@@ -37,6 +37,11 @@ project, the permission system auto-rejects it, and the run dies.
 6. **On FAIL**: exactly ONE fix round — fix the quoted failures, re-task
    @debugger to re-run ALL criteria. If still FAIL, stop and report failure.
 
+If a @debugger call errors out with "operation timed out", "stream stalled",
+"not resumable in-stream", "Internal Server Error" or "terminated", the model
+endpoint dropped the connection. That is not a validation failure and not a fix
+round: re-task @debugger with the same criteria immediately.
+
 ## COMPLETION PROTOCOL (non-negotiable)
 
 You may declare success ONLY IF the most recent @debugger response contains
