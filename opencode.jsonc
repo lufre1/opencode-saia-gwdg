@@ -64,7 +64,7 @@
     "solo": {
       "description": "Default workhorse: plans, implements, self-checks in one session, then independent @debugger validation (~5-12 requests/task)",
       "mode": "primary",
-      "model": "saia-gwdg/qwen3-coder-next",
+      "model": "saia-gwdg/glm-5.3-flash",
       "temperature": 0.2,
       "steps": 60,
       "prompt": "{file:./prompts/solo.md}",
@@ -88,7 +88,7 @@
     "auto": {
       "description": "Orchestrator for big/ambiguous multi-file tasks: plan → implement → validate loop (max 1 fix round)",
       "mode": "primary",
-      "model": "saia-gwdg/qwen3.5-122b-a10b",
+      "model": "saia-gwdg/qwen3.8-27b",
       "temperature": 0.2,
       "steps": 40,
       "prompt": "{file:./prompts/auto.md}",

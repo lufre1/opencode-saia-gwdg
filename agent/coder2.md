@@ -1,7 +1,7 @@
 ---
 description: Fix-round implementer on a different model family (breaks correlated errors)
 mode: subagent
-model: saia-gwdg/glm-4.7
+model: saia-gwdg/glm-5.3-flash
 temperature: 0.2
 steps: 60
 permission:

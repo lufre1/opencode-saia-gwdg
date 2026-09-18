@@ -45,7 +45,7 @@ const effortFor = (modelId, level) =>
 
 // The bug that made /effort a no-op: `thinking` is ignored by the Qwen/vLLM
 // chat template, only `enable_thinking` is read.
-assert.deepEqual(effortFor("qwen3.5-122b-a10b", "off"), { enable_thinking: false });
+assert.deepEqual(effortFor("glm-5.3-flash", "off"), { enable_thinking: false });
 assert.deepEqual(effortFor("qwen3.8-27b", "off"), { enable_thinking: false });
 assert.ok(
   !/[^_]\bthinking\s*:/.test(effortKwargsSrc),
@@ -69,7 +69,7 @@ assert.deepEqual(effortFor("qwen3.8-27b", "medium"), {
 
 // Models with no alias entry pass every level through unchanged.
 for (const level of ["low", "medium", "high", "max"]) {
-  assert.deepEqual(effortFor("qwen3.5-122b-a10b", level), {
+  assert.deepEqual(effortFor("glm-5.3-flash", level), {
     enable_thinking: true,
     reasoning_effort: level,
   });

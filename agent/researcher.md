@@ -1,7 +1,7 @@
 ---
 description: "Read-only analyst: produces PLAN blocks with runnable acceptance criteria"
 mode: subagent
-model: saia-gwdg/qwen3.5-122b-a10b
+model: saia-gwdg/deepseek-v4-flash-0731
 temperature: 0.2
 steps: 25
 permission:

@@ -1,7 +1,7 @@
 ---
 description: "Implementation agent: executes an audited PLAN, returns CHANGES block"
 mode: subagent
-model: saia-gwdg/qwen3-coder-next
+model: saia-gwdg/qwen3.8-27b
 temperature: 0.2
 steps: 60
 permission:

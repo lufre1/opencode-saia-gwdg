@@ -27,21 +27,21 @@ The repo mirrors the installed `~/.config/opencode` layout using opencode's auto
 
 | Agent | Role | Model (plugin may override) | Temp | Steps | Permissions | Prompt |
 |-------|------|-----------------------------|------|-------|-------------|--------|
-| `build` | Primary | global/model | 0.2 | - | Full | built-in |
-| `plan` | Primary | global/model | default | - | Ask (edit/bash) | built-in |
+| `build` | Primary | qwen3.8-27b | 0.2 | - | Full | built-in |
+| `plan` | Primary | deepseek-v4-flash-0731 | default | - | Ask (edit/bash) | built-in |
 | `general` | Subagent (native) | deepseek-v4-flash | default | - | built-in | built-in |
-| `explore` | Subagent (native) | qwen3-coder-next | default | - | built-in (read-only) | built-in |
-| `solo` | Primary (optional) | qwen3-coder-next | 0.2 | 60 | Full + task deny-by-exception (`*` denied, `debugger` allowed); `skill`, `todowrite`, `webfetch` disabled | `prompts/solo.md` |
-| `auto` | Primary (optional) | qwen3.5-122b-a10b | 0.2 | 40 | Read-only (read/glob/grep/list) + task allow-by-exception (`*` allowed, `general`/`explore` denied); `skill`, `todowrite`, `webfetch` disabled | `prompts/auto.md` |
-| `coder` | Subagent | qwen3-coder-next | 0.2 | 60 | Full; `skill` disabled | `agent/coder.md` |
-| `coder2` | Subagent | glm-4.7 | 0.2 | 60 | Full; `skill` disabled | `agent/coder2.md` (body replaced with `coder`'s by the plugin) |
-| `researcher` | Subagent | qwen3.5-122b-a10b | 0.2 | 25 | Read-only; `skill`, `webfetch` disabled | `agent/researcher.md` |
+| `explore` | Subagent (native) | glm-5.3-flash | default | - | built-in (read-only) | built-in |
+| `solo` | Primary (optional) | glm-5.3-flash | 0.2 | 60 | Full + task deny-by-exception (`*` denied, `debugger` allowed); `skill`, `todowrite`, `webfetch` disabled | `prompts/solo.md` |
+| `auto` | Primary (optional) | qwen3.8-27b | 0.2 | 40 | Read-only (read/glob/grep/list) + task allow-by-exception (`*` allowed, `general`/`explore` denied); `skill`, `todowrite`, `webfetch` disabled | `prompts/auto.md` |
+| `coder` | Subagent | qwen3.8-27b | 0.2 | 60 | Full; `skill` disabled | `agent/coder.md` |
+| `coder2` | Subagent | glm-5.3-flash | 0.2 | 60 | Full; `skill` disabled | `agent/coder2.md` (body replaced with `coder`'s by the plugin) |
+| `researcher` | Subagent | deepseek-v4-flash-0731 | 0.2 | 25 | Read-only; `skill`, `webfetch` disabled | `agent/researcher.md` |
 | `debugger` | Subagent | qwen3-coder-next | 0.1 | 25 | Full; `skill`, `todowrite`, `webfetch` disabled | `agent/debugger.md` |
 
 ### Usage
 
 - **Primary agents** (`build`, `plan`, `solo`, `auto`): Press `Tab` to switch
-- **`solo` is the default workhorse** (~5-12 requests/task): one full-context session that plans, implements, self-checks, then tasks `@debugger` for independent validation. Use `auto` only for big/ambiguous multi-file tasks where deep upfront planning (397b researcher) is worth the chain's ~40% coordination overhead (~20-40 requests/task)
+- **`solo` is the default workhorse** (~5-12 requests/task): one full-context session that plans, implements, self-checks, then tasks `@debugger` for independent validation. Use `auto` only for big/ambiguous multi-file tasks where deep upfront planning (deepseek researcher) is worth the chain's ~40% coordination overhead (~20-40 requests/task)
 - **Subagents** (`coder`, `coder2`, `researcher`, `debugger`): Invoke with `@coder`, `@coder2`, `@researcher`, or `@debugger` in your message; `coder2` (different model family) exists for fix rounds. They are defined in `agent/*.md`, install unconditionally, and are taskable from any primary that does not deny them — including the built-in `build` agent, since opencode's native ruleset allows `task` by default. Adding a subagent means adding one `agent/<name>.md` plus a `ROLE_MODELS` entry — no primary needs editing
 
 ### Auto Mode Workflow

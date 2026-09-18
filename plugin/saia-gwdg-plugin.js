@@ -1187,34 +1187,38 @@ const EFFORT_ALIAS = {
 // Preferred model per agent role, best first. The plugin picks the first entry
 // that SAIA currently reports as `ready`; if none are ready it falls back to any
 // available model so auto mode keeps working. Edit THIS to change auto-mode models.
+//
+// Excluded everywhere (re-pinned 2026-09-18 after SAIA dropped
+// qwen3.5-122b-a10b and glm-4.7 from its list):
+// - qwen3.5-397b-a17b: unusable on GWDG SAIA — its endpoint hung on 3 of 4
+//   dispatches (2026-07-13/14), stalling the whole chain; confirmed still
+//   unavailable 2026-09-18. A "ready"-but-hanging model is worse than none.
+// - devstral-2: its SAIA chat template rejects opencode's step-cap continuation
+//   ("Cannot set add_generation_prompt ... last message is from the assistant"),
+//   burning a full step budget per try.
 const ROLE_MODELS = {
-  // Solo workhorse: strongest tool-use coder, full-context single session.
-  solo:       ["qwen3-coder-next", "glm-4.7"],
+  // Solo workhorse: a thinking model for the one full-context session that
+  // plans, implements and self-checks. glm-5.3-flash's 2026-09-09
+  // headers-timeout incident is what the model-health breaker below is for.
+  solo:       ["glm-5.3-flash", "deepseek-v4-flash-0731"],
   // Orchestrator: best rule-following per request; deepseek-v4-flash demoted
   // (ignores prompt rules under task pressure — verified 2026-07-13).
-  // qwen3.5-397b-a17b dropped — its endpoint hangs (see researcher note below).
-  auto:       ["qwen3.5-122b-a10b", "deepseek-v4-flash-0731"],
-  // Planning is the highest-leverage request in the chain. qwen3.5-397b was
-  // removed entirely: its endpoint hung on 3 of 4 dispatches (2026-07-13/14),
-  // stalling the whole chain — a "ready"-but-hanging model is worse than none.
-  researcher: ["qwen3.5-122b-a10b", "qwen3-coder-next"],
-  coder:      ["qwen3-coder-next", "glm-4.7"],
-  // Native plan->build workflow: the strongest benchmark result (spreadsheet
-  // 33/34 at 36 requests, 2026-07-14) was plan+build fully on deepseek —
-  // best implementer, poor orchestrator (rule-following), so it lives here
-  // and NOT in solo/auto. solo stays on qwen: 2-3x cheaper per task.
-  plan:       ["deepseek-v4-flash-0731", "qwen3.5-122b-a10b"],
-  build:      ["qwen3-coder-next", "deepseek-v4-flash-0731"],
-  // Fix rounds run on a DIFFERENT model family to break correlated errors.
-  coder2:     ["glm-4.7", "mistral-medium-3.5-128b"],
+  auto:       ["qwen3.8-27b", "deepseek-v4-flash-0731"],
+  // Planning is the highest-leverage request in the chain.
+  researcher: ["deepseek-v4-flash-0731", "qwen3-coder-next"],
+  // Implementation: qwen3.8-27b for rule-following. Every coding subagent keeps
+  // qwen3-coder-next as its first fallback.
+  coder:      ["qwen3.8-27b", "qwen3-coder-next"],
+  plan:       ["deepseek-v4-flash-0731", "qwen3.8-27b", "glm-5.3-flash"],
+  build:      ["qwen3.8-27b", "qwen3-coder-next"],
+  // Fix rounds run on a DIFFERENT model family to break correlated errors
+  // (glm vs the qwen primary on coder).
+  coder2:     ["glm-5.3-flash", "qwen3-coder-next"],
   debugger:   ["qwen3-coder-next", "openai-gpt-oss-120b"],
   // Native opencode subagents (always shipped). general is a versatile
-  // read+write helper; explore is read-only search — kept cheaper.
+  // read+write helper; explore is read-only search.
   general:    ["deepseek-v4-flash-0731", "qwen3-coder-next"],
-  explore:    ["qwen3-coder-next", "qwen3.5-122b-a10b"],
-  // devstral-2 is excluded everywhere: its SAIA chat template rejects
-  // opencode's step-cap continuation ("Cannot set add_generation_prompt ...
-  // last message is from the assistant"), burning a full step budget per try.
+  explore:    ["glm-5.3-flash", "qwen3-coder-next"],
 };
 
 const BUCKET_LIMITS = { hour: 200, day: 1000, month: 3000 };

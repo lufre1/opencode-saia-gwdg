@@ -59,7 +59,7 @@ five-hundred|5000|5000|4|120|resp 500
 slow-json|5000|5000|4|120|body-fail TimeoutError
 tiered-deadline|15000|5000|99|150|fail TimeoutError .*try=1 .*timeout=5000ms	fail TimeoutError .*try=3 .*timeout=15000ms	!try=1 .*timeout=15000ms
 accept-silent-then-500|15000|5000|99|150|fail TimeoutError .*timeout=5000ms .*retrying=true	resp 500	!transport-fail-marker
-breaker|15000|5000|2|180|model-unhealthy qwen3-coder-next	model-substitute qwen3-coder-next -> glm-4.7	req .*model=glm-4.7
+breaker|15000|5000|2|180|model-unhealthy qwen3-coder-next	model-substitute qwen3-coder-next -> deepseek-v4-flash-0731	req .*model=deepseek-v4-flash-0731
 TABLE
 )
 
