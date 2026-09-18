@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit 0441adc-dirty, packed 2026-09-16T12:32:04Z
+# Source: opencode-config commit 53a0878-dirty, packed 2026-09-18T05:49:30Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — always installed, as
@@ -1687,6 +1687,7 @@ const RESUMABLE_PATTERNS = [
   /socket hang up/i,
   /fetch failed/i,
   /premature close/i,
+  /EngineCore encountered an issue/i,
 ];
 
 // Decides whether an opencode error is worth re-prompting for. Fails CLOSED:

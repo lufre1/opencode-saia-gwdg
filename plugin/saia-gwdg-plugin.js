@@ -1327,6 +1327,7 @@ const RESUMABLE_PATTERNS = [
   /socket hang up/i,
   /fetch failed/i,
   /premature close/i,
+  /EngineCore encountered an issue/i,
 ];
 
 // Decides whether an opencode error is worth re-prompting for. Fails CLOSED:
