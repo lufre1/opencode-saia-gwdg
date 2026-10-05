@@ -6,6 +6,7 @@ so neither the real systemd user manager nor the real shell rc is touched.
 
 import json
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -82,6 +83,18 @@ class FragmentTest(unittest.TestCase):
                             base_url="http://127.0.0.1:8787/v1")
         self.assertEqual(url, "http://127.0.0.1:8787/v1")
         self.assertFalse(self.cfg.exists())
+
+    def test_gateway_override_does_no_work_without_python(self):
+        # benchmark containers: an override with no python3 must stay silent
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        for tool in ("bash", "dirname"):        # what the fragment needs, minus python3
+            (bin_dir / tool).symlink_to(shutil.which(tool))
+        url, out = self.setup("bench-token", env={"SAIA_API_KEYS_EXTRA": "k2",
+                                                  "PATH": str(bin_dir)},
+                              base_url="http://saia-gw:8787/v1")
+        self.assertEqual(url, "http://saia-gw:8787/v1")
+        self.assertNotIn("WARNING", out)
 
     def test_no_keyring_flag_wins(self):
         url, _ = self.setup("k1", ["--no-keyring", "--extra-keys", "k2"])

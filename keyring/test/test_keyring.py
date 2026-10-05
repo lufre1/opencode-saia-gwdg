@@ -173,6 +173,13 @@ class KeyringTest(unittest.TestCase):
         self.assertEqual(self.call()[0].status, 200)
         self.assertEqual(self.fake.keys_called(), [B])
 
+    def test_concurrent_401s_log_the_dead_key_once(self):
+        self.start([A, B])
+        ks = self.kr.ring.keys[0]
+        self.kr.ring.mark_dead(ks)
+        self.kr.ring.mark_dead(ks)
+        self.assertEqual(sum("rejected (401/403)" in m for m in self.logs), 1)
+
     def test_all_dead_names_the_real_cause(self):
         self.fake.default[A] = "403"
         self.start([A])

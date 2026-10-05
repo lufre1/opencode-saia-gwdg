@@ -259,6 +259,8 @@ class KeyRing:
 
     def mark_dead(self, ks):
         with self.lock:
+            if ks.dead_since:   # concurrent requests (mcode sends 3 per turn) share one 401
+                return
             ks.dead_since = now()
         log(f"{ks.label} rejected (401/403) — dropped from rotation. "
             f"The key is revoked or expired; {RENEW_HINT[0].lower() + RENEW_HINT[1:]}.")

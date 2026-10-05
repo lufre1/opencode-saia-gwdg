@@ -309,6 +309,10 @@ keyring_setup() {
   SAIA_EFFECTIVE_BASE_URL="${SAIA_BASE_URL:-$KEYRING_PROD_URL}"
   KEYRING_ACTIVE=0
   [[ "$KEYRING_MODE" == off ]] && return 0
+  # A test or benchmark gateway (SAIA_BASE_URL override) does its own key
+  # handling — never put the proxy in front of it unless asked to, and do no
+  # work at all there (benchmark containers may not even have python3).
+  [[ "$KEYRING_MODE" == on || "${SAIA_EFFECTIVE_BASE_URL%/}" == "$KEYRING_PROD_URL" ]] || return 0
   KEYRING_PY="$(command -v python3 || true)"
   if [[ -z "$KEYRING_PY" ]]; then
     if [[ "$KEYRING_MODE" == on || -n "$KEYRING_EXTRA_KEYS$KEYRING_EXTRA_KEYS_FILE${SAIA_API_KEYS_EXTRA:-}" ]]; then
@@ -319,18 +323,13 @@ keyring_setup() {
   collected="$(_keyring_collect "$primary")"
   n="$(_keyring_field "$collected" keys)"
   source="$(_keyring_field "$collected" source)"
-  if [[ "$KEYRING_MODE" == auto ]]; then
-    # A test or benchmark gateway (SAIA_BASE_URL override) does its own key
-    # handling — never put the proxy in front of it unless asked to.
-    [[ "$SAIA_EFFECTIVE_BASE_URL" == "$KEYRING_PROD_URL" ]] || return 0
-    if (( n < 2 )); then
-      local oc="$HOME/.local/share/opencode/saia-gwdg-keys.json"
-      if [[ -f "$oc" ]]; then
-        echo "Tip: opencode has extra SAIA keys in $oc — re-run with"
-        echo "     --extra-keys-file $oc  to swap keys automatically here too."
-      fi
-      return 0
+  if [[ "$KEYRING_MODE" == auto ]] && (( n < 2 )); then
+    local oc="$HOME/.local/share/opencode/saia-gwdg-keys.json"
+    if [[ -f "$oc" ]]; then
+      echo "Tip: opencode has extra SAIA keys in $oc — re-run with"
+      echo "     --extra-keys-file $oc  to swap keys automatically here too."
     fi
+    return 0
   fi
   port="${SAIA_KEYRING_PORT:-$(_keyring_config_port)}"
   KR_KEYS_JSON="$collected" _keyring_write_config "$port"
