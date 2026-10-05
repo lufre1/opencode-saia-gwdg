@@ -28,6 +28,7 @@ auto-discovered folders.
 | `tool/`, `skill/` | Scaffolds (with READMEs) for future opencode custom tools / skills — see [How the folders work](#how-the-folders-work) |
 | `yagni.md` | Global instruction appended to every agent's prompt |
 | `build-setup.sh` | Regenerates the installer |
+| `keyring/` | The plugin's automatic key swap as a local proxy for the **other** harness installers (aider, mini-swe-agent, OpenHands, Pi, omp, mcode) — not part of the opencode install, see below |
 | `setup-saia-opencode.sh` | Generated installer (never edit directly) |
 
 The API key is **not** in the repo — the installer writes it to
@@ -100,6 +101,17 @@ points: because `build-setup.sh` globs them (`tool/*.js` / `tool/*.ts`, `skill/*
 a real tool or skill added later ships with no config edit. `nullglob` means an empty folder
 just ships nothing — no error. Their READMEs document the expected layout so contributors
 get it right, and those scaffold READMEs are deliberately **not** packed into the installer.
+
+**`keyring/` — automatic key swap for the other harnesses.** The plugin's key rotation
+(next key on 401/403, low `x-ratelimit-remaining-*` budget or 429) only works inside
+opencode. `keyring/saia_keyring.py` is the same rotation as a stdlib-Python proxy on
+`127.0.0.1:8788`, and `keyring/saia-keyring.sh` is the install logic the
+`<harness>-saia` installers source: with 2+ keys they start the proxy (systemd user
+unit / launchd agent / shell rc) and point the harness at it; with one key they leave
+the harness talking to SAIA directly. Both files are **vendored** byte-identical into
+each harness repo's `src/`: edit them here, then run `keyring/sync.sh` (copies and
+rebuilds every installer; `--check` only reports drift) and commit each repo. Tests:
+`python3 -m unittest discover keyring/test`. `build-setup.sh` does not pack this folder.
 
 ## Setup
 

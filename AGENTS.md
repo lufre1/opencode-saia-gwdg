@@ -21,6 +21,7 @@ The repo mirrors the installed `~/.config/opencode` layout using opencode's auto
 | `auth.json` (in `~/.local/share/opencode/`) | Stores API key (chmod 600) |
 | `saia-gwdg-keys.json` (in `~/.local/share/opencode/`) | Optional extra failover keys `{"keys": [...]}` (chmod 600); auth.json key is always #1 |
 | `build-setup.sh` | Packs the live config into `setup-saia-opencode.sh` — rerun after config changes |
+| `keyring/` | Key-rotating proxy (`saia_keyring.py`) + installer fragment (`saia-keyring.sh`) for the *other* harness installers; vendored into their `src/` by `keyring/sync.sh`, never packed into the opencode installer |
 | `setup-saia-opencode.sh` | Generated self-contained installer for other devices (never edit directly) |
 
 ## Agents
