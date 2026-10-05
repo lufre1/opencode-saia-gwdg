@@ -479,6 +479,13 @@ def make_handler(kr):
                                  "keys": kr.ring.describe()})
 
         def proxy(self, method):
+            try:
+                self.handle_proxy(method)
+            except (BrokenPipeError, ConnectionResetError):
+                # the harness hung up first (its own timeout, Ctrl-C) — nothing to answer
+                self.close_connection = True
+
+        def handle_proxy(self, method):
             kr.reload_if_changed()
             path = self.path
             if path.split("?", 1)[0] == HEALTH_PATH and method == "GET":

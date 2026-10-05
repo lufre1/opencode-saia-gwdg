@@ -72,6 +72,9 @@ class FakeUpstream:
                     return self.send_body(int(action), {"error": "invalid key"})
                 if action == "429":
                     return self.send_body(429, {"error": "rate"}, rl)
+                if action == "slow":
+                    time.sleep(1.5)
+                    return self.send_body(200, {"ok": True}, rl)
                 if action == "500":
                     return self.send_body(500, {"error": "boom"}, rl)
                 if action == "stream":
@@ -289,6 +292,23 @@ class KeyringTest(unittest.TestCase):
         self.start([A, B])
         self.assertEqual(self.call()[0].status, 500)
         self.assertEqual(self.fake.keys_called(), [A], "5xx is not a key problem")
+
+    def test_client_hanging_up_is_not_an_error(self):
+        # live 2026-10-05: SAIA went silent, the harness gave up, and the
+        # proxy's late 504 hit a closed socket -> traceback in proxy.log
+        self.fake.default[A] = "slow"
+        self.start([A])
+        errors = []
+        self.srv.handle_error = lambda request, addr: errors.append(addr)
+        with mock.patch.object(sk, "UPSTREAM_TIMEOUT_S", 0.5):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=0.2)
+            conn.request("POST", "/v1/chat/completions", body=b"{}",
+                         headers={"Authorization": f"Bearer {A}"})
+            with self.assertRaises(OSError):
+                conn.getresponse()
+            conn.close()
+            time.sleep(1.0)
+        self.assertEqual(errors, [])
 
     def test_upstream_down_is_502(self):
         self.start([A], upstream="http://127.0.0.1:9/v1")
