@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 ROOT="${SAIA_REPOS_ROOT:-$(cd ../.. && pwd)}"
-REPOS=(aider-saia-gwdg mini-swe-agent-saia-gwdg openhands-saia-gwdg pi-saia-gwdg omp-saia-gwdg mcode-saia)
+REPOS=(aider-saia-gwdg mini-swe-agent-saia-gwdg openhands-saia-gwdg pi-saia-gwdg omp-saia-gwdg mcode-saia-gwdg)
 FILES=(saia_keyring.py saia-keyring.sh)
 CHECK=0
 [[ "${1:-}" == --check ]] && CHECK=1
