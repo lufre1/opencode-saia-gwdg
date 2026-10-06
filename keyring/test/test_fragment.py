@@ -65,8 +65,16 @@ class FragmentTest(unittest.TestCase):
         self.assertEqual(url, PROD)
         self.assertFalse(self.cfg.exists(), "no keyring config for a single key")
 
-    def test_two_keys_start_the_proxy(self):
-        url, out = self.setup("k1", env={"SAIA_API_KEYS_EXTRA": "k2, k3,k2"})
+    def test_extra_keys_alone_never_start_the_proxy(self):
+        # the installers must work for anyone without the proxy: it is opt-in
+        url, out = self.setup("k1", ["--extra-keys", "k2"], env={"SAIA_API_KEYS_EXTRA": "k3"})
+        self.assertEqual(url, PROD)
+        self.assertFalse(self.cfg.exists())
+        self.assertIsNone(sk.fetch_health(self.port))
+        self.assertIn("opt-in (add --keyring)", out)
+
+    def test_keyring_flag_starts_the_proxy(self):
+        url, out = self.setup("k1", ["--keyring"], env={"SAIA_API_KEYS_EXTRA": "k2, k3,k2"})
         self.assertEqual(url, f"http://127.0.0.1:{self.port}/v1", out)
         data = json.loads(self.cfg.read_text())
         self.assertEqual(data, {"upstream": PROD, "port": self.port, "keys": ["k1", "k2", "k3"]})
@@ -113,11 +121,11 @@ class FragmentTest(unittest.TestCase):
         self.assertEqual(self.fake.keys_called(), ["dead", "good"])
 
     def test_extras_kept_on_reinstall_and_backed_up_on_change(self):
-        self.setup("k1", ["--extra-keys", "k2"])
-        url, out = self.setup("k1")
+        self.setup("k1", ["--keyring", "--extra-keys", "k2"])
+        url, out = self.setup("k1", ["--keyring"])
         self.assertIn("kept", out)
         self.assertEqual(json.loads(self.cfg.read_text())["keys"], ["k1", "k2"])
-        self.setup("k1", ["--extra-keys", "k9"])
+        self.setup("k1", ["--keyring", "--extra-keys", "k9"])
         self.assertEqual(json.loads(self.cfg.read_text())["keys"], ["k1", "k9"])
         baks = list(self.cfg.parent.glob("keyring.json.bak-*"))
         self.assertEqual(len(baks), 1)
@@ -131,16 +139,16 @@ class FragmentTest(unittest.TestCase):
     def test_extras_file_in_opencode_format_and_plain_lines(self):
         oc = self.home / "saia-gwdg-keys.json"
         oc.write_text(json.dumps({"keys": ["k2", "k3"]}))
-        self.setup("k1", ["--extra-keys-file", str(oc)])
+        self.setup("k1", ["--keyring", "--extra-keys-file", str(oc)])
         self.assertEqual(json.loads(self.cfg.read_text())["keys"], ["k1", "k2", "k3"])
         plain = self.home / "keys.txt"
         plain.write_text("# mine\nk4\n\nk5\n")
-        self.setup("k1", ["--extra-keys-file", str(plain)])
+        self.setup("k1", ["--keyring", "--extra-keys-file", str(plain)])
         self.assertEqual(json.loads(self.cfg.read_text())["keys"], ["k1", "k4", "k5"])
 
     def test_missing_extras_file_is_a_clear_error(self):
         p = subprocess.run(["bash", "-c", f'set -e; source "{FRAGMENT}"; '
-                            'KEYRING_EXTRA_KEYS_FILE=/nope keyring_setup k1'],
+                            'KEYRING_MODE=on KEYRING_EXTRA_KEYS_FILE=/nope keyring_setup k1'],
                            env={"PATH": os.environ["PATH"], "HOME": str(self.home)},
                            capture_output=True, text=True)
         self.assertNotEqual(p.returncode, 0)
@@ -150,15 +158,17 @@ class FragmentTest(unittest.TestCase):
         oc = self.home / ".local/share/opencode/saia-gwdg-keys.json"
         oc.parent.mkdir(parents=True)
         oc.write_text('{"keys": ["k2"]}')
-        _, out = self.setup("k1")
-        self.assertIn(f"--extra-keys-file {oc}", out)
+        url, out = self.setup("k1")
+        self.assertIn(f"--keyring --extra-keys-file {oc}", out)
+        self.assertEqual(url, PROD, "a tip only — the proxy stays off")
+        self.assertFalse(self.cfg.exists())
 
     def test_rc_mode_adds_one_block(self):
         rc = self.home / ".bashrc"
         rc.write_text("export FOO=1\n")
         env = {"SAIA_KEYRING_SERVICE": "rc", "SAIA_SHELL_RC": str(rc)}
-        self.setup("k1", ["--extra-keys", "k2"], env=env)
-        self.setup("k1", ["--extra-keys", "k2"], env=env)
+        self.setup("k1", ["--keyring", "--extra-keys", "k2"], env=env)
+        self.setup("k1", ["--keyring", "--extra-keys", "k2"], env=env)
         text = rc.read_text()
         self.assertTrue(text.startswith("export FOO=1\n"))
         self.assertEqual(text.count(">>> saia-keyring"), 1)
@@ -166,11 +176,11 @@ class FragmentTest(unittest.TestCase):
         self.assertIsNotNone(sk.fetch_health(self.port))
 
     def test_stale_proxy_is_replaced_when_the_file_changes(self):
-        self.setup("k1", ["--extra-keys", "k2"])
+        self.setup("k1", ["--keyring", "--extra-keys", "k2"])
         old_pid = sk.fetch_health(self.port)["pid"]
         installed = self.home / ".local/share/saia-keyring/saia_keyring.py"
         installed.write_text(installed.read_text() + "\n# older build\n")
-        self.setup("k1", ["--extra-keys", "k2"])
+        self.setup("k1", ["--keyring", "--extra-keys", "k2"])
         new = sk.fetch_health(self.port)
         self.assertIsNotNone(new)
         self.assertNotEqual(new["pid"], old_pid)

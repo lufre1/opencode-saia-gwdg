@@ -106,9 +106,10 @@ get it right, and those scaffold READMEs are deliberately **not** packed into th
 (next key on 401/403, low `x-ratelimit-remaining-*` budget or 429) only works inside
 opencode. `keyring/saia_keyring.py` is the same rotation as a stdlib-Python proxy on
 `127.0.0.1:8788`, and `keyring/saia-keyring.sh` is the install logic the
-`<harness>-saia` installers source: with 2+ keys they start the proxy (systemd user
-unit / launchd agent / shell rc) and point the harness at it; with one key they leave
-the harness talking to SAIA directly. Both files are **vendored** byte-identical into
+`<harness>-saia` installers source. It is **opt-in**: by default an installer leaves the
+harness talking to SAIA directly with one key, depending on nothing else; only with
+`--keyring` (plus extra keys) does it start the proxy (systemd user unit / launchd
+agent / shell rc) and point the harness at it. Both files are **vendored** byte-identical into
 each harness repo's `src/`: edit them here, then run `keyring/sync.sh` (copies and
 rebuilds every installer; `--check` only reports drift) and commit each repo. Tests:
 `python3 -m unittest discover keyring/test`. `build-setup.sh` does not pack this folder.
