@@ -26,7 +26,7 @@ MODES = {
     "headers-stall-toolcall": "headers + content + tool_call arg fragments, then silence",
     "late-error": "a complete stream including finish_reason, then kill the socket",
     "accept-silent": "accept the connection and never send headers",
-    "empty-200": "200 + event-stream, no kong headers, no bytes ever",
+    "empty-200": "200 + event-stream, then no bytes ever (must get the normal idle window)",
     "five-hundred": "500 on the first 3 requests of the process, then ok",
     "accept-silent-then-500": "never send headers on the first 2 requests, then 500 forever",
     "breaker": "never send headers, on every request forever",
@@ -70,18 +70,15 @@ class Handler(BaseHTTPRequestHandler):
                     return pair[5:]
         return DEFAULT_MODE
 
-    def _stream_headers(self, kong=True):
+    def _stream_headers(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
-        # The plugin treats a 200 with neither header as a dead replica and
-        # uses the short EMPTY_200_TIMEOUT_MS window instead of the idle one.
-        if kong:
-            self.send_header("x-kong-request-id", "fake-kong-id")
-            self.send_header("x-kong-upstream-latency", "12")
-        for bucket, left in (("minute", 29), ("hour", 199), ("day", 999), ("month", 2999)):
-            self.send_header(f"x-ratelimit-remaining-{bucket}", str(left))
+        # Shaped like the Caddy gateway SAIA moved to on 2026-10-27: no kong
+        # headers at all, and per-window rate-limit names.
+        for bucket, left in (("10s", 1), ("hour", 199), ("day", 399), ("month", 2999)):
+            self.send_header(f"x-ratelimit-remaining-requests-{bucket}", str(left))
         self.end_headers()
 
     def _write_chunked(self, data: bytes):
@@ -186,7 +183,7 @@ class Handler(BaseHTTPRequestHandler):
         time.sleep(STALL_SECONDS)
 
     def _m_empty_200(self):
-        self._stream_headers(kong=False)
+        self._stream_headers()
         time.sleep(STALL_SECONDS)
 
     def _m_five_hundred(self):

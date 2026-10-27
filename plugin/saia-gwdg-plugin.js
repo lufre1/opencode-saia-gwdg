@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 // The model list is cached for a week: the cache is authoritative while its
 // fetchedAt is younger than MODELS_TTL_MS, so most launches cost zero SAIA
 // requests. Older/missing cache triggers one /v1/models fetch (shared bucket:
-// 30/min, 200/hour, 1000/day, 3000/month), with the stale cache as fallback
+// 2/10s, 200/hour, 400/day, 3000/month), with the stale cache as fallback
 // on fetch failure. Force a refresh with /reload_models (runs
 // reload-models.sh, which rewrites the cache with a fresh fetchedAt).
 const CACHE_PATH = join(homedir(), ".cache/opencode/saia-gwdg-models.json");
@@ -14,7 +14,8 @@ const MODELS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Request pacer: wraps globalThis.fetch for chat-ai.academiccloud.de only.
-// - spaces request starts >= 2100ms apart so the 30/min limit can't trip
+// - spaces request starts >= 5100ms apart so the 2-per-10s limit can't trip
+//   (was 30/min until the 2026-10-27 gateway swap)
 // - supports multiple API keys with hard-floor failover: rate limits are
 //   per key, and opencode only knows the auth.json key, so the pacer
 //   rewrites the Authorization header to the active key on every request.
@@ -44,7 +45,7 @@ const SAIA_HOST = "chat-ai.academiccloud.de";
 const SAIA_TEST_HOST = process.env.SAIA_TEST_HOST || null;
 const SAIA_PROD_BASE_URL = "https://chat-ai.academiccloud.de/v1";
 const SAIA_BASE_URL = process.env.SAIA_BASE_URL || SAIA_PROD_BASE_URL;
-const MIN_INTERVAL_MS = 2100;
+const MIN_INTERVAL_MS = 5100;
 const HOUR_FLOOR = 5;
 const DAY_FLOOR = 10;
 const MONTH_FLOOR = 30;
@@ -112,9 +113,6 @@ const STREAM_IDLE_TIMEOUT_MS = TIMEOUT_MS;
 // a longer idle window so slow reasoning survives, while a truly dead replica
 // (no data for SLOW_IDLE_TIMEOUT_MS) is still caught.
 const SLOW_IDLE_TIMEOUT_MS = 90_000;
-// A 200 with no kong id / upstream latency is a dead replica that returns no
-// data. Don't wait the full idle timeout on it — retry after a short window.
-const EMPTY_200_TIMEOUT_MS = 10_000;
 // A mid-stream stall is resumed by re-issuing the request with the tail of the
 // text already streamed as the join point. Only the tail is sent: the whole
 // partial is already on the user's screen, so quoting all of it back would cost
@@ -461,16 +459,15 @@ function installPacer(keys) {
     } catch {}
   };
 
-  const deadReplica = (resp) =>
-    resp.status === 200 &&
-    resp.headers.get("x-kong-request-id") === null &&
-    resp.headers.get("x-kong-upstream-latency") === null;
-
   const readBuckets = (resp, key) => {
     const s = stateFor(key);
     let headerPresent = false;
     for (const b of ["minute", "hour", "day", "month"]) {
-      const v = resp.headers.get(`x-ratelimit-remaining-${b}`);
+      // Old Kong names first, then the Caddy gateway's (2026-10-27), whose
+      // shortest window is 10s rather than a minute; it fills the `minute` slot.
+      const v =
+        resp.headers.get(`x-ratelimit-remaining-${b}`) ??
+        resp.headers.get(`x-ratelimit-remaining-requests-${b === "minute" ? "10s" : b}`);
       if (v !== null) {
         s.remaining[b] = Number(v);
         headerPresent = true;
@@ -632,7 +629,7 @@ function installPacer(keys) {
       // Model-health breaker: if this model has been failing to send headers,
       // put a healthy stand-in on the wire instead. Rebinding `init` and
       // `model` here rather than deeper means every downstream consumer — the
-      // req/resp/fail log lines, SILENT_PACED_MODELS, pickIdleTimeout and
+      // req/resp/fail log lines, SILENT_PACED_MODELS, the idle window and
       // wrapStreamWithRetry — follows the model actually being requested.
       //
       // Trade-off, accepted deliberately: opencode's UI and its token/cost
@@ -856,7 +853,7 @@ function installPacer(keys) {
         let retries = 0;
         const MAX_STREAM_RETRIES = MAX_CONNECT_TRIES;
 
-        const readStream = async (resp, initialEmpty) => {
+        const readStream = async (resp) => {
           const reader = resp.body?.getReader();
           if (!reader) {
             pacerDebugLog(`stream-no-body ${label(k)} id=${reqId}`);
@@ -883,20 +880,13 @@ function installPacer(keys) {
           // complete from there on and a later transport error costs nothing.
           let finishSeen = null;
           // Silent-paced models get a longer idle window so slow-but-alive
-          // reasoning isn't killed; a known-dead empty-200 (no kong id, no data)
-          // gets a short window so we don't wait the full timeout on a dead node.
-          // `let`, not const: a retry can land on a different replica, and
-          // keeping the dead-replica window (10s) for a healthy-but-slow retry
-          // would stall-and-retry it to death.
-          let idleTimeout = 0;
-          const pickIdleTimeout = (empty) => {
-            idleTimeout = empty
-              ? EMPTY_200_TIMEOUT_MS
-              : SILENT_PACED_MODELS.has(model)
-                ? SLOW_IDLE_TIMEOUT_MS
-                : STREAM_IDLE_TIMEOUT_MS;
-          };
-          pickIdleTimeout(initialEmpty);
+          // reasoning isn't killed. There is deliberately no short window for
+          // a 200 without kong headers: since the 2026-10-27 gateway swap
+          // (Kong -> Caddy) NO response carries them, and headers now arrive
+          // before prefill, so the first body byte legitimately takes as long
+          // as TTFB used to (qwen3.8-27b p50 14s). The old 10s "dead replica"
+          // window killed every long-context turn at exactly 10.00s.
+          const idleTimeout = SILENT_PACED_MODELS.has(model) ? SLOW_IDLE_TIMEOUT_MS : STREAM_IDLE_TIMEOUT_MS;
 
           const armIdleTimer = (r) => {
             if (idleTimer) return; // re-entrancy guard: one stall detector per reader
@@ -1085,7 +1075,6 @@ function installPacer(keys) {
               }
               r = newResp.body.getReader();
               currentReader = r;
-              pickIdleTimeout(deadReplica(newResp));
               stalled = false;
             }
           };
@@ -1105,11 +1094,7 @@ function installPacer(keys) {
         };
 
         const finalResp = initialResp ?? (await attempt(k));
-        // A 200 with no kong id and no upstream latency is a dead replica that
-        // accepted the connection but returns no data — retry it fast instead of
-        // waiting the full idle timeout on a node that will never respond.
-        const initialEmpty = deadReplica(finalResp);
-        const bodyStream = await readStream(finalResp, initialEmpty);
+        const bodyStream = await readStream(finalResp);
         return new Response(bodyStream, {
           status: finalResp.status,
           statusText: finalResp.statusText,
@@ -1129,7 +1114,8 @@ function installPacer(keys) {
         resp = await attempt(key);
       }
       if (resp.status === 429) {
-        const reset = Number(resp.headers.get("ratelimit-reset")) || 60;
+        const reset =
+          Number(resp.headers.get("ratelimit-reset") ?? resp.headers.get("x-ratelimit-reset-requests-10s")) || 60;
         pacerDebugLog(`429 ${url.pathname} on ${label(key)} — waiting ${Math.min(reset, 65)}s before one retry`);
         await sleep(Math.min(reset, 65) * 1000);
         resp = await attempt(key);

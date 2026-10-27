@@ -15,7 +15,7 @@ What it does:
 1. Checks for `opencode` (also looks in `~/.opencode/bin`); if missing, offers to run the official installer (`curl -fsSL https://opencode.ai/install | bash`).
 2. Writes `opencode.jsonc`, `plugin/saia-gwdg-plugin.js`, `command/*.md`, `scripts/*.sh`, `yagni.md`, all `agent/*.md`, and the selected primaries' `prompts/*.md` into `~/.config/opencode/` (using those auto-discovered folders). Files that would be overwritten are backed up to `~/.config/opencode.bak-<timestamp>/` first; unchanged files are left alone (rerunning is safe).
 3. Writes the API key to `~/.local/share/opencode/auth.json` (chmod 600) as `{"saia-gwdg": {"type": "api", "key": "..."}}`, merging into an existing auth.json rather than clobbering other providers. An existing saia-gwdg key is kept unless `--force-key` is passed.
-4. Verifies by running `opencode models` and checking that `saia-gwdg/` models are listed (costs 1 request of the shared GWDG rate budget: 30/min, 200/hour per key).
+4. Verifies by running `opencode models` and checking that `saia-gwdg/` models are listed (costs 1 request of the shared GWDG rate budget: 2/10s, 200/hour per key).
 
 ### Agent selection
 

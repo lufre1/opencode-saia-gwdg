@@ -47,14 +47,14 @@ stop_server() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev
 # same value in both columns reproduces the old flat-deadline behaviour and
 # leaves the pre-existing rows asserting exactly what they always did.
 CASES=$(cat <<'TABLE'
-ok|45000|45000|4|60|stream-done
+ok|45000|45000|4|60|stream-done	resp 200 .*remaining=1/min 199/hour 399/day
 slow|45000|45000|4|150|stream-done .*total=[6-9][0-9]{4}ms	!stream-fail	!stream-error
 headers-stall|5000|5000|4|120|stream-stall	stream-retry .*anchor=[1-9]	stream-error .*retryable=true
 headers-stall-long|5000|5000|4|150|stream-retry .*truncated=true	!stream-truncated
 headers-stall-toolcall|5000|5000|4|150|stream-toolcall-abandon	auto-resume scheduled	!stream-retry
 late-error|5000|5000|4|60|stream-late-error-ignored	!stream-fail
 accept-silent|5000|5000|4|120|fail TimeoutError .*retrying=true	fail TimeoutError .*retrying=false	transport-fail-marker
-empty-200|45000|45000|4|120|stream-stall .*timeout=10000ms
+empty-200|5000|5000|4|120|stream-stall .*timeout=5000ms	!timeout=10000ms
 five-hundred|5000|5000|4|120|resp 500
 slow-json|5000|5000|4|120|body-fail TimeoutError
 tiered-deadline|15000|5000|99|150|fail TimeoutError .*try=1 .*timeout=5000ms	fail TimeoutError .*try=3 .*timeout=15000ms	!try=1 .*timeout=15000ms
