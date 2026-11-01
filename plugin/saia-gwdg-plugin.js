@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync } from "fs";
-import { homedir } from "os";
+import { readFileSync, writeFileSync, mkdirSync, appendFileSync, statSync, renameSync, accessSync, constants } from "fs";
+import { homedir, tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -143,6 +143,23 @@ const RESET_TTL_MS = { hour: 60 * 60000, day: 24 * 3600000, month: 30 * 86400000
 // Hostnames the pacer intercepts. Exactly the production host unless a test
 // host is exported.
 const SAIA_HOSTS = new Set([SAIA_HOST, ...(SAIA_TEST_HOST ? [SAIA_TEST_HOST] : [])]);
+
+// Scratch files without permission prompts. opencode already creates
+// join(os.tmpdir(), "opencode") (Global.Path.tmp), pre-approves it under
+// external_directory for every agent and tells the model to use it — but
+// mktemp and Python's tempfile still default to plain /tmp, and every such path
+// raised an external_directory prompt that stalled the session until someone
+// answered (one `rm -rf /tmp/tmp.*` sat 16h). Pointing TMPDIR there routes them
+// into the approved dir. Derived from os.tmpdir(), so a cluster's own $TMPDIR is
+// kept as the root. Stashed on globalThis so a re-evaluation cannot nest it.
+// Left alone when not writable, e.g. a shared login node's /tmp/opencode owned
+// by another user — mktemp failing would be worse than a prompt.
+const OC_TMP = (globalThis.__saiaTmp ??= join(tmpdir(), "opencode"));
+try {
+  mkdirSync(OC_TMP, { recursive: true });
+  accessSync(OC_TMP, constants.W_OK);
+  process.env.TMPDIR = OC_TMP;
+} catch {}
 
 // Debug trail for everything the plugin decides (requests, cache hits,
 // prompt injection). Always on: the failures worth catching are rare and
@@ -295,7 +312,14 @@ function installPacer(keys) {
   globalThis.__saiaPacerInstalled = true;
 
   const realFetch = globalThis.fetch.bind(globalThis);
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Every wait the pacer does on a caller's behalf takes the caller's signal, so
+  // Esc lands now instead of after a 30s cooldown / 65s 429 wait / pacing slot.
+  const sleep = (ms, signal) =>
+    new Promise((res, rej) => {
+      if (signal?.aborted) return rej(signal.reason);
+      const t = setTimeout(res, ms);
+      signal?.addEventListener("abort", () => (clearTimeout(t), rej(signal.reason)), { once: true });
+    });
 
   // Races a promise against a deadline. Used for the body phase, where there is
   // no signal to abort (the headers deadline is already cleared by then).
@@ -333,7 +357,7 @@ function installPacer(keys) {
     headers.delete("content-length");
     return { resp: new Response(text, { status: resp.status, statusText: resp.statusText, headers }), text };
   };
-  let queue = Promise.resolve(); // serializes SAIA requests
+  let queue = Promise.resolve(); // serializes request STARTS, not whole requests (see startGate)
   let lastStart = 0;
   let consecutive5xx = 0; // global: an outage is key-independent
   let activeIndex = 0;
@@ -618,10 +642,19 @@ function installPacer(keys) {
       model = JSON.parse(init?.body)?.model || "";
     } catch {}
 
+    // Resolved by attempt() the moment this request is put on the wire (and by
+    // the finally below if it never gets that far). The NEXT request waits on
+    // this, not on `run`: holding the queue until headers arrived meant one hung
+    // request froze every other SAIA request in the process — parallel
+    // subagents, title generation — for its whole 20+20+45s (45+5+45+5+45s for
+    // SILENT_PACED_MODELS) retry budget, with no log line for the waiters.
+    let started;
+    const startGate = new Promise((r) => (started = r));
+
     const run = queue.then(async () => {
       if (consecutive5xx >= MAX_CONSECUTIVE_5XX) {
         pacerDebugLog(`cooldown: ${consecutive5xx} consecutive 5xx — sleeping 30s (head-of-line: queue blocked)`);
-        await sleep(30_000);
+        await sleep(30_000, init?.signal);
         consecutive5xx = 0;
         pacerDebugLog("cooldown: done, resuming queue");
       }
@@ -711,9 +744,6 @@ function installPacer(keys) {
       };
 
       const attempt = async (k, continuation) => {
-        const wait = lastStart + MIN_INTERVAL_MS - Date.now();
-        if (wait > 0) await sleep(wait);
-        lastStart = Date.now();
         const reasoningModels = globalThis.__saiaReasoning ?? new Set();
         // Rebuilt per try (below) rather than once: applyBreaker() can rebind
         // `init` between tries, and effInit has to be derived from the current
@@ -726,6 +756,15 @@ function installPacer(keys) {
         // fresh connection is re-load-balanced — so retrying here is what
         // actually recovers. The caller's own abort is never retried.
         for (let tryNo = 1; ; tryNo++) {
+          // Reserve this try's start slot synchronously — per TRY, not per
+          // request. The queue no longer serializes whole requests, so connect
+          // retries, stream resumes and the next queued request run
+          // concurrently; reading lastStart and then sleeping on it let two of
+          // them start together and trip the 2-per-10s limit.
+          const at = Math.max(Date.now(), lastStart + MIN_INTERVAL_MS);
+          lastStart = at;
+          await sleep(at - Date.now(), init?.signal);
+          started();
           applyBreaker();
           effInit = withEffort(input, continuationInit(continuation), url, reasoningModels);
           // The deadline wraps only the network call, so queue wait, 2100ms
@@ -782,7 +821,7 @@ function installPacer(keys) {
             if (e?.name === "TimeoutError" && !effInit?.signal?.aborted) recordModelTimeout(model);
             if (retrying) {
               if (SILENT_PACED_MODELS.has(model)) {
-                await sleep(RETRY_BACKOFF_MS);
+                await sleep(RETRY_BACKOFF_MS, init?.signal);
                 pacerDebugLog(`backoff ${RETRY_BACKOFF_MS}ms before retry ${tryNo + 1} for ${model} (silent-drop pacing)`);
               }
               continue;
@@ -879,6 +918,11 @@ function installPacer(keys) {
           // finish_reason, once the stream reports one: the turn is semantically
           // complete from there on and a later transport error costs nothing.
           let finishSeen = null;
+          // An in-band error event (vLLM sends one, then [DONE], when the engine
+          // fails mid-stream). opencode surfaces it as an error by itself.
+          let errorSeen = false;
+          // The consumer (opencode) cancelled our stream: stop, never retry.
+          let cancelled = false;
           // Silent-paced models get a longer idle window so slow-but-alive
           // reasoning isn't killed. There is deliberately no short window for
           // a 200 without kong headers: since the 2026-10-27 gateway swap
@@ -928,6 +972,7 @@ function installPacer(keys) {
                     for (const tc of delta.tool_calls) toolArgChars += (tc?.function?.arguments ?? "").length;
                   }
                   if (choice?.finish_reason) finishSeen = choice.finish_reason;
+                  if (evt?.error || evt?.object === "error") errorSeen = true;
                 } catch {}
               }
             }
@@ -965,7 +1010,16 @@ function installPacer(keys) {
                 clearTimeout(idleTimer);
                 idleTimer = null;
                 if (done) {
-                  return stalled ? { kind: "retry", err: new Error("stream stalled") } : { kind: "done" };
+                  if (stalled) return { kind: "retry", err: new Error("stream stalled") };
+                  // A body that ends cleanly with no finish_reason is truncated,
+                  // not complete. opencode reads the missing reason as "unknown"
+                  // and CONTINUES its loop: verified against the fake endpoint,
+                  // it re-sent the turn every 5.1s forever (18 requests in 90s,
+                  // no error, no step cap on build/plan). Treat it as a stall.
+                  if (!finishSeen && !errorSeen && !cancelled) {
+                    return { kind: "retry", err: new Error("SAIA stream ended without finish_reason") };
+                  }
+                  return { kind: "done" };
                 }
                 ingest(value);
                 ctrl.enqueue(value);
@@ -987,9 +1041,10 @@ function installPacer(keys) {
             let r = firstReader;
             for (;;) {
               const out = await drain(r, ctrl);
+              if (cancelled) return;
               if (out.kind === "done") {
                 ctrl.close();
-                pacerDebugLog(`stream-done ${label(k)} id=${reqId} total=${Date.now() - startedAt}ms`);
+                pacerDebugLog(`stream-done ${label(k)} id=${reqId} total=${Date.now() - startedAt}ms finish=${finishSeen}`);
                 return;
               }
               const e = out.err;
@@ -1049,7 +1104,7 @@ function installPacer(keys) {
 
               retries++;
               if (SILENT_PACED_MODELS.has(model)) {
-                await sleep(RETRY_BACKOFF_MS);
+                await sleep(RETRY_BACKOFF_MS, signal);
                 pacerDebugLog(`backoff ${RETRY_BACKOFF_MS}ms before stream retry ${retries} for ${model}`);
               }
               const anchor = resumeAnchor();
@@ -1084,6 +1139,7 @@ function installPacer(keys) {
               await pump(reader, ctrl);
             },
             cancel() {
+              cancelled = true;
               clearTimeout(idleTimer);
               idleTimer = null;
               currentReader.cancel().catch(() => {});
@@ -1117,7 +1173,7 @@ function installPacer(keys) {
         const reset =
           Number(resp.headers.get("ratelimit-reset") ?? resp.headers.get("x-ratelimit-reset-requests-10s")) || 60;
         pacerDebugLog(`429 ${url.pathname} on ${label(key)} — waiting ${Math.min(reset, 65)}s before one retry`);
-        await sleep(Math.min(reset, 65) * 1000);
+        await sleep(Math.min(reset, 65) * 1000, init?.signal);
         resp = await attempt(key);
         if (resp.status === 429) {
           // out of budget despite pacing — fail this key over, try the next once
@@ -1143,10 +1199,12 @@ function installPacer(keys) {
         return await wrapStreamWithRetry(input, init, url, key, reqId, model, resp);
       }
       return resp;
-    });
+    }).finally(() => started());
 
-    // keep the chain alive even when a request fails
-    queue = run.catch(() => {});
+    // The next request may start once this one has STARTED (see startGate).
+    // Spacing is kept by the slot reservation in attempt(); the 30s 5xx
+    // cooldown above still runs before started(), so it still holds everyone.
+    queue = startGate;
     return run;
   };
 }
@@ -1317,6 +1375,10 @@ const RESUMABLE_PATTERNS = [
   /socket hang up/i,
   /fetch failed/i,
   /premature close/i,
+  // Bun's (opencode's runtime) wording for a socket that died mid-body; it
+  // never says "terminated"/ECONNRESET like undici does.
+  /socket connection was closed unexpectedly/i,
+  /ended without finish_reason/i,
   /EngineCore encountered an issue/i,
 ];
 

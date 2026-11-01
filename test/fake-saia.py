@@ -32,6 +32,9 @@ MODES = {
     "breaker": "never send headers, on every request forever",
     "tiered-deadline": "never send headers (alias of accept-silent, asserts the per-try deadlines)",
     "slow-json": "non-streaming: content-type json, half a body, then silence",
+    "clean-eof": "content, then a cleanly ended body with no finish_reason and no [DONE]",
+    "abrupt-close": "content, then the socket dies mid-body (no finish_reason)",
+    "first-silent": "the first request of the process never gets headers, the rest are ok",
 }
 
 PORT = int(os.environ.get("FAKE_SAIA_PORT", "8787"))
@@ -41,6 +44,7 @@ STALL_SECONDS = 600  # "forever" as far as any plugin deadline is concerned
 
 _five_hundred_count = 0
 _stall_then_500_count = 0
+_first_silent_count = 0
 
 
 def sse(delta, finish=None, extra=None):
@@ -226,6 +230,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self._write_chunked(b'{"id": "chatcmpl-fake", "choices": [')
         time.sleep(STALL_SECONDS)
+
+    def _m_clean_eof(self):
+        # opencode reads a missing finish_reason as "unknown" and re-sends the
+        # turn forever; the pacer must treat this as a stall, not a success.
+        self._stream_headers()
+        for word in ("Partial", " answer", " then"):
+            self._write_chunked(sse({"content": word}))
+        self._write_chunked(b"")
+
+    def _m_abrupt_close(self):
+        # Bun words this "The socket connection was closed unexpectedly".
+        self._stream_headers()
+        for word in ("Partial", " answer", " then"):
+            self._write_chunked(sse({"content": word}))
+        self.connection.shutdown(2)  # SHUT_RDWR, without the zero chunk
+        self.connection.close()
+
+    def _m_first_silent(self):
+        # One hung request must not hold up the others (opencode run sends the
+        # title request and the turn concurrently).
+        global _first_silent_count
+        _first_silent_count += 1
+        if _first_silent_count == 1:
+            time.sleep(STALL_SECONDS)
+        else:
+            self._m_ok()
 
 
 if __name__ == "__main__":

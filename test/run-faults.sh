@@ -59,6 +59,9 @@ five-hundred|5000|5000|4|120|resp 500
 slow-json|5000|5000|4|120|body-fail TimeoutError
 tiered-deadline|15000|5000|99|150|fail TimeoutError .*try=1 .*timeout=5000ms	fail TimeoutError .*try=3 .*timeout=15000ms	!try=1 .*timeout=15000ms
 accept-silent-then-500|15000|5000|99|150|fail TimeoutError .*timeout=5000ms .*retrying=true	resp 500	!transport-fail-marker
+clean-eof|5000|5000|4|90|stream-error .*ended without finish_reason	stream-retry .*anchor=[1-9]	stream-fail	!stream-done
+abrupt-close|5000|5000|4|90|stream-retry .*retry=3/3	stream-fail .*socket connection was closed
+first-silent|15000|5000|99|90|fail TimeoutError .*try=1	stream-done	!try=1 queued=[1-9][0-9]{4,}ms
 breaker|15000|5000|2|180|model-unhealthy qwen3-coder-next	model-substitute qwen3-coder-next -> deepseek-v4-flash-0731	req .*model=deepseek-v4-flash-0731
 TABLE
 )
