@@ -10,6 +10,7 @@ Run the installer to set up on a new device:
 GWDG_API_KEY="your-key" bash setup-saia-opencode.sh
 ```
 
+On Windows, run `setup-saia-opencode.cmd` (next to the `.sh`; needs Git for Windows + Python).
 Or see `SETUP.md` for detailed instructions and agent selection options.
 
 ## Files
@@ -30,6 +31,7 @@ auto-discovered folders.
 | `build-setup.sh` | Regenerates the installer |
 | `keyring/` | The plugin's automatic key swap as a local proxy for the **other** harness installers (aider, mini-swe-agent, OpenHands, Pi, omp, mcode) — not part of the opencode install, see below |
 | `setup-saia-opencode.sh` | Generated installer (never edit directly) |
+| `setup-saia-opencode.cmd` | Windows launcher: runs the `.sh` under Git Bash (hand-written, not generated) |
 
 The API key is **not** in the repo — the installer writes it to
 `~/.local/share/opencode/auth.json` (chmod 600).

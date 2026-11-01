@@ -17,6 +17,42 @@ What it does:
 3. Writes the API key to `~/.local/share/opencode/auth.json` (chmod 600) as `{"saia-gwdg": {"type": "api", "key": "..."}}`, merging into an existing auth.json rather than clobbering other providers. An existing saia-gwdg key is kept unless `--force-key` is passed.
 4. Verifies by running `opencode models` and checking that `saia-gwdg/` models are listed (costs 1 request of the shared GWDG rate budget: 2/10s, 200/hour per key).
 
+## Windows
+
+Native Windows uses the **same** installer, run under Git Bash — opencode itself
+runs its shell (and the `/usage`, `/effort`, `/reload_models` scripts) through
+Git Bash on Windows, so there is no separate PowerShell port to drift.
+
+Prerequisites: [Git for Windows](https://git-scm.com/download/win)
+(`winget install Git.Git`) and Python from python.org (`winget install Python.Python.3.12`;
+the Microsoft Store `python3` alias is not enough).
+
+Put `setup-saia-opencode.cmd` and `setup-saia-opencode.sh` in the same folder, then
+double-click the `.cmd`, or from cmd (PowerShell: `$env:GWDG_API_KEY="your-key"`,
+then `.\setup-saia-opencode.cmd --solo --auto`):
+
+```bat
+set GWDG_API_KEY=your-key
+setup-saia-opencode.cmd --solo --auto
+```
+
+(Or open Git Bash there and run `bash setup-saia-opencode.sh` as on Linux.) Don't
+type plain `bash setup-saia-opencode.sh` in cmd/PowerShell: that is usually WSL's
+`bash.exe` and installs into the WSL home, which the Windows opencode never reads.
+
+- Files land in `%USERPROFILE%\.config\opencode`, `%USERPROFILE%\.local\share\opencode`
+  and `%USERPROFILE%\.cache\opencode` — the same `~`-relative paths opencode uses on
+  every OS. Don't set a custom `%HOME%`: the slash-command scripts use `$HOME` while
+  opencode uses `%USERPROFILE%`.
+- If opencode is missing, the official `curl | bash` installer handles Git Bash
+  (windows-x64, needs `unzip`); alternatives: `npm i -g opencode-ai`,
+  `scoop install opencode`, `choco install opencode`. With the curl install, add
+  `%USERPROFILE%\.opencode\bin` to your user PATH to run opencode outside Git Bash.
+- Git installed outside `Program Files` (e.g. scoop)? Set `OPENCODE_GIT_BASH_PATH` to
+  its `bin\bash.exe` — the launcher and opencode both read it.
+- `chmod 600` is a no-op on NTFS; `auth.json` is protected by your user-profile ACL.
+- WSL: run the `.sh` inside WSL exactly as on Linux — that configures the WSL opencode.
+
 ### Agent selection
 
 Only the two **primary** agents are optional. The four subagents (`@coder`,

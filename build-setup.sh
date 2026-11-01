@@ -103,6 +103,17 @@ OC_GEN_HEADER
 cat >>"$TMP_OUT" <<'OC_GEN_BODY'
 set -euo pipefail
 
+# Windows = Git Bash (setup-saia-opencode.cmd launches it). opencode resolves ~
+# via os.homedir(), i.e. %USERPROFILE%, while Git Bash prefers a custom %HOME%
+# if one is set — pin HOME so every path below is the one opencode reads.
+IS_WINDOWS=0
+case "$(uname -s)" in MINGW*|MSYS*) IS_WINDOWS=1 ;; esac
+if [[ $IS_WINDOWS -eq 1 && -n "${USERPROFILE:-}" ]]; then
+  HOME="$(cygpath -u "$USERPROFILE")"
+fi
+# Windows Python defaults to cp1252; opencode.jsonc is UTF-8 (em dashes).
+export PYTHONUTF8=1
+
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 DATA_DIR="$HOME/.local/share/opencode"   # the plugin hardcodes this path
 AUTH_FILE="$DATA_DIR/auth.json"
@@ -129,6 +140,9 @@ Installs the GWDG SAIA setup for opencode:
     agent/*.md, usable from any primary (including the built-in build agent)
   - optional PRIMARY agents: solo (default workhorse), auto (orchestrator)
     (default: prompt interactively unless --yes is passed)
+
+Requires python3 (Windows: python.org Python; run setup-saia-opencode.cmd,
+which needs Git for Windows).
 
 Options:
   -y, --yes        answer yes to prompts (e.g. installing opencode)
@@ -157,6 +171,20 @@ for arg in "$@"; do
     *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# First Python that actually RUNS — `command -v python3` is not enough: on
+# Windows the Microsoft Store alias python3.exe is on PATH but exits 9009, and
+# python.org installs `python`/`py`, not `python3`. Required, and checked before
+# anything is written: without it the jsonc filter would be skipped while the
+# declined primaries' prompts are still deleted (dangling {file:...}).
+PY=""
+for c in python3 python "py -3"; do
+  $c -c '' >/dev/null 2>&1 && { PY=$c; break; }   # unquoted: "py -3" is two words
+done
+if [[ -z "$PY" ]]; then
+  echo "ERROR: python3 is required (Windows: install Python from python.org)." >&2
+  exit 1
+fi
 
 if [[ $ASSUME_YES -eq 1 ]]; then
   # If --yes is passed but no explicit agent flags, default to skip both
@@ -218,7 +246,8 @@ ensure_opencode() {
     return 0
   fi
   if confirm "opencode is not installed. Run the official installer now (curl -fsSL https://opencode.ai/install | bash)?"; then
-    curl -fsSL https://opencode.ai/install | bash
+    curl -fsSL https://opencode.ai/install | bash \
+      || die "opencode install failed. Alternatives: npm i -g opencode-ai (any OS), scoop install opencode / choco install opencode (Windows) — then rerun."
     export PATH="$HOME/.opencode/bin:$PATH"
     command -v opencode >/dev/null 2>&1 || die "opencode still not found after install"
     log "opencode installed: $(command -v opencode)"
@@ -241,6 +270,12 @@ ensure_path_in_shellrc() {
     log "Added opencode to PATH in $rc (source it or restart your shell)"
   else
     log "PATH entry already present in $rc"
+  fi
+  # ponytail: hint only — editing the Windows user PATH programmatically
+  # (SetEnvironmentVariable) flattens its REG_EXPAND_SZ %VAR% entries.
+  if [[ $IS_WINDOWS -eq 1 && "$(command -v opencode)" == "$HOME/.opencode/bin/"* ]]; then
+    log "Windows: the line above only helps Git Bash. To run opencode from PowerShell/cmd,"
+    log "  add %USERPROFILE%\\.opencode\\bin to your user PATH (Settings > 'environment variables')."
   fi
 }
 
@@ -346,9 +381,8 @@ setup_auth_key() {
   if [[ -f "$AUTH_FILE" ]]; then
     backup_existing "auth.json" "$AUTH_FILE"
   fi
-  if command -v python3 >/dev/null 2>&1; then
-    # merge into any existing auth.json (it may hold other providers' keys)
-    ( umask 077; KEY="$key" AUTH_FILE="$AUTH_FILE" python3 - <<'PYEOF'
+  # merge into any existing auth.json (it may hold other providers' keys)
+  ( umask 077; KEY="$key" AUTH_FILE="$AUTH_FILE" $PY - <<'PYEOF'
 import json, os
 path = os.environ["AUTH_FILE"]
 try:
@@ -365,17 +399,8 @@ with open(tmp, "w") as fh:
     fh.write("\n")
 os.replace(tmp, path)
 PYEOF
-    )
-  else
-    if [[ -f "$AUTH_FILE" ]]; then
-      die "python3 not found and $AUTH_FILE already exists — add this entry manually: {\"saia-gwdg\": {\"type\": \"api\", \"key\": \"...\"}}"
-    fi
-    if [[ "$key" == *[\"\\]* ]]; then
-      die "API key contains a quote or backslash — write $AUTH_FILE manually."
-    fi
-    ( umask 077; printf '{\n  "saia-gwdg": {\n    "type": "api",\n    "key": "%s"\n  }\n}\n' "$key" >"$AUTH_FILE" )
-  fi
-  chmod 600 "$AUTH_FILE"
+  )
+  chmod 600 "$AUTH_FILE"   # no-op on NTFS: there the user-profile ACL protects it
   log "API key written to $AUTH_FILE (chmod 600)."
 }
 
@@ -387,12 +412,10 @@ setup_extra_keys() {
     fi
     return 0
   fi
-  command -v python3 >/dev/null 2>&1 \
-    || die "python3 required to write $keys_file — create it manually: {\"keys\": [\"key2\", ...]}"
   if [[ -f "$keys_file" ]]; then
     backup_existing "saia-gwdg-keys.json" "$keys_file"
   fi
-  ( umask 077; EXTRA="$extra" KEYS_FILE="$keys_file" python3 - <<'PYEOF'
+  ( umask 077; EXTRA="$extra" KEYS_FILE="$keys_file" $PY - <<'PYEOF'
 import json, os
 keys = [k.strip() for k in os.environ["EXTRA"].split(",") if k.strip()]
 path = os.environ["KEYS_FILE"]
@@ -417,13 +440,8 @@ fix_instructions_path() {
   if [[ ! -f "$input" ]]; then
     return 0
   fi
-  
-  if ! command -v python3 >/dev/null 2>&1; then
-    log "  python3 not found - cannot fix instructions path, skipping"
-    return 0
-  fi
-  
-  ( umask 077; python3 - "$input" "$CONFIG_DIR" <<'PYEOF'
+
+  ( umask 077; $PY - "$input" "$CONFIG_DIR" <<'PYEOF'
 import json, os, sys
 input_path = sys.argv[1]
 config_dir = sys.argv[2]
@@ -458,13 +476,8 @@ filter_opencode_jsonc() {
   if [[ ! -f "$input" ]]; then
     return 0
   fi
-  
-  if ! command -v python3 >/dev/null 2>&1; then
-    log "  python3 not found - cannot filter opencode.jsonc, skipping agent filtering"
-    return 0
-  fi
-  
-  ( umask 077; python3 - "$input" "$INSTALL_SOLO" "$INSTALL_AUTO" <<'PYEOF'
+
+  ( umask 077; $PY - "$input" "$INSTALL_SOLO" "$INSTALL_AUTO" <<'PYEOF'
 import json, re, sys
 input_path = sys.argv[1]
 install_solo = int(sys.argv[2])

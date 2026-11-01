@@ -12,7 +12,16 @@
 #
 set -euo pipefail
 
-exec python3 - <<'PYEOF'
+# First Python that actually runs: Windows has python/py and a python3 Store
+# stub that exits 9009. UTF-8 so em dashes / model names survive opencode's pipe.
+export PYTHONUTF8=1
+PY=""
+for c in python3 python "py -3"; do
+  $c -c '' >/dev/null 2>&1 && { PY=$c; break; }   # unquoted: "py -3" is two words
+done
+[[ -n "$PY" ]] || { echo "ERROR: python3 not found — /usage needs it."; exit 0; }
+
+exec $PY - <<'PYEOF'
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -130,7 +139,8 @@ budget_section()
 midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 month_start = midnight.replace(day=1)
 try:
-    db = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=3)
+    # as_uri(): "file:C:\Users\..." is no valid URI on Windows (and it escapes spaces)
+    db = sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True, timeout=3)
     try:
         usage_table(f"Usage today (since {midnight:%Y-%m-%d %H:%M})",
                     collect(db, midnight.timestamp() * 1000))

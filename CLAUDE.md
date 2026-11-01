@@ -5,7 +5,7 @@ This file provides guidance to Claude Code when working with this opencode SAIA 
 ## Quick reference
 
 - **Build command:** `./build-setup.sh` — regenerates `setup-saia-opencode.sh` after config changes
-- **Install:** `bash setup-saia-opencode.sh` (interactive prompts for agent selection) or `--yes`/`--solo`/`--auto` flags
+- **Install:** `bash setup-saia-opencode.sh` (interactive prompts for agent selection) or `--yes`/`--solo`/`--auto` flags. Windows: `setup-saia-opencode.cmd` (same args), which runs the `.sh` under Git Bash
 - **Model refresh:** `/reload_models` in opencode or `bash scripts/reload-models.sh`, then restart opencode
 - **Reasoning effort:** `/effort off|low|medium|high|max` in opencode or `bash scripts/effort.sh` (applies to the current session immediately — the pacer re-reads the setting per request)
 - **Request log:** `~/.cache/opencode/saia-gwdg-pacer.log` — always on, one `req`/`resp` (or `fail`) line per SAIA request. `SAIA_PACER_DEBUG=1` additionally captures 5xx response bodies.
@@ -30,6 +30,7 @@ The repo uses opencode's auto-discovered folders (installed 1:1 into `~/.config/
 ## Gotchas
 
 - `setup-saia-opencode.sh` is generated — never edit directly; regenerate after any config change
+- Windows support = the same `.sh` under Git Bash, launched by the hand-written `setup-saia-opencode.cmd` (CRLF via `.gitattributes`, kept free of labels/`goto` so an LF copy still parses). Never add a parallel PowerShell installer: the slash commands are bash scripts that opencode runs through Git Bash on Windows anyway. Every script that calls Python resolves it as the first of `python3`/`python`/`py -3` that **runs** (`-c ''`) — `command -v python3` passes on the Microsoft Store stub, which then exits 9009. Python is a hard requirement of the installer (checked before anything is written)
 - Rate limits: 2 req/10s, 200/hour, 400/day, 3000/month shared across all agents (30/min and 1000/day until the 2026-10-27 gateway swap)
 - `permission.task` is resolved **last-match-wins**, so the wildcard MUST come first in both primaries. `agent.auto.permission.task` is allow-by-exception (`"*": "allow"` then `general`/`explore` denied — so a new `agent/*.md` is taskable with no edit); `agent.solo.permission.task` is deny-by-exception (`"*": "deny"` then `debugger` allowed — deliberate: solo's cost contract is ~5-12 requests/task and its roster does not grow)
 - Adding a subagent = adding one `agent/<name>.md` + one `ROLE_MODELS` entry in the plugin. No edit to any primary. Do add it to `prompts/auto.md`'s workflow description if `auto` should actually use it

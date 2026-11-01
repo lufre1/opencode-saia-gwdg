@@ -13,8 +13,15 @@ AUTH_FILE="$HOME/.local/share/opencode/auth.json"
 KEYS_FILE="$HOME/.local/share/opencode/saia-gwdg-keys.json"
 CACHE_FILE="$HOME/.cache/opencode/saia-gwdg-models.json"
 
+# First Python that actually runs (Windows: python/py; python3 is a Store stub).
+PY=""
+for c in python3 python "py -3"; do
+  $c -c '' >/dev/null 2>&1 && { PY=$c; break; }   # unquoted: "py -3" is two words
+done
+[[ -n "$PY" ]] || { echo "ERROR: python3 not found — /reload_models needs it." >&2; exit 1; }
+
 # auth.json key first, then any extra failover keys (same order as the plugin)
-KEYS="$(AUTH_FILE="$AUTH_FILE" KEYS_FILE="$KEYS_FILE" python3 -c "
+KEYS="$(AUTH_FILE="$AUTH_FILE" KEYS_FILE="$KEYS_FILE" $PY -c "
 import json, os
 keys = [json.load(open(os.environ['AUTH_FILE']))['saia-gwdg']['key']]
 try:
@@ -28,6 +35,7 @@ print('\n'.join(keys))
 
 BODY=""
 while IFS= read -r KEY; do
+  KEY="${KEY%$'\r'}"   # Windows Python prints CRLF; a trailing \r breaks the header
   [[ -z "$KEY" ]] && continue
   if BODY="$(curl -sS --fail --max-time 60 https://chat-ai.academiccloud.de/v1/models \
       -H "Authorization: Bearer $KEY")"; then
@@ -39,7 +47,7 @@ done <<<"$KEYS"
 [[ -n "$BODY" ]] || { echo "ERROR: /v1/models fetch failed with all keys — cache left untouched" >&2; exit 1; }
 
 mkdir -p "$(dirname "$CACHE_FILE")"
-BODY="$BODY" CACHE_FILE="$CACHE_FILE" python3 - <<'PYEOF'
+BODY="$BODY" CACHE_FILE="$CACHE_FILE" $PY - <<'PYEOF'
 import json, os, time
 body = json.loads(os.environ["BODY"])
 models = body["data"]
