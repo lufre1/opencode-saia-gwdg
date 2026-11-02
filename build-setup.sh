@@ -94,6 +94,14 @@ else
   echo "WARNING: node not found — skipping the syntax check of $PLUGIN" >&2
 fi
 
+# --minimal's default model: ROLE_MODELS.build[0], read from the plugin so that
+# re-pinning `build` there moves the minimal default too (no second copy).
+DEFAULT_MODEL="$(sed -nE 's/^ *build: *\["([^"]+)".*/\1/p' "$PLUGIN" | head -1)"
+if [[ -z "$DEFAULT_MODEL" ]]; then
+  echo "ERROR: could not read ROLE_MODELS.build[0] from $PLUGIN (the --minimal default model)" >&2
+  exit 1
+fi
+
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIRTY=""
 git diff --quiet HEAD -- "${MANIFEST[@]}" 2>/dev/null || DIRTY="-dirty"
@@ -111,12 +119,16 @@ cat >"$TMP_OUT" <<OC_GEN_HEADER
 # Source: opencode-config commit $COMMIT$DIRTY, packed $STAMP
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
-# subagents (coder, coder2, researcher, debugger — always installed, as
-# auto-discovered agent/*.md files), and the two OPTIONAL primary agents
+# subagents (coder, coder2, researcher, debugger — as auto-discovered
+# agent/*.md files), the slash commands, and the two OPTIONAL primary agents
 # (solo, auto). Use flags or interactive prompts to choose the primaries.
+# --minimal installs ONLY the provider + plugin (no agents, no commands).
 #
 # Usage: [GWDG_API_KEY=... GWDG_API_KEYS_EXTRA=key2,key3] bash setup-saia-opencode.sh [OPTIONS]
 #
+
+# Default model of a --minimal install (ROLE_MODELS.build[0] at pack time).
+MINIMAL_DEFAULT_MODEL="saia-gwdg/$DEFAULT_MODEL"
 OC_GEN_HEADER
 
 # ── Static installer body ────────────────────────────────────────────
@@ -142,7 +154,14 @@ ASSUME_YES=0
 FORCE_KEY=0
 INSTALL_SOLO=2
 INSTALL_AUTO=2
+MINIMAL=2
 OPENCODE_MISSING=0
+
+# --minimal installs only these; every other packed file is "full-only" and is
+# skipped by write_file (and recorded in SKIPPED_FULL, the exact list
+# remove_full_only_files backs up and deletes over an earlier full install).
+MINIMAL_FILES=(opencode.jsonc plugin/saia-gwdg-plugin.js)
+SKIPPED_FULL=()
 
 usage() {
   cat <<'USAGE'
@@ -156,16 +175,25 @@ Installs the GWDG SAIA setup for opencode:
     ~/.local/share/opencode/saia-gwdg-keys.json (chmod 600) — the plugin
     switches to the next key when the active one's rate budget is exhausted
   - offers to install opencode itself if missing
-  - subagents @coder, @coder2, @researcher, @debugger — ALWAYS installed as
-    agent/*.md, usable from any primary (including the built-in build agent)
+  - subagents @coder, @coder2, @researcher, @debugger — installed as
+    agent/*.md (unless --minimal), usable from any primary (including the
+    built-in build agent)
   - optional PRIMARY agents: solo (default workhorse), auto (orchestrator)
     (default: prompt interactively unless --yes is passed)
+
+--minimal installs ONLY the SAIA provider: opencode.jsonc (provider block +
+a default saia-gwdg model) and the plugin (live model list, rate pacing, key
+rotation, stall retry) — no agents, slash commands, prompts or yagni.md. Run
+over an earlier full install, it backs up and removes the files that install
+shipped. Rerun without --minimal to get the full setup back.
 
 Requires python3 (Windows: python.org Python; run setup-saia-opencode.cmd,
 which needs Git for Windows).
 
 Options:
   -y, --yes        answer yes to prompts (e.g. installing opencode)
+       --minimal   SAIA provider + plugin only (default: ask, unless any
+                   other agent flag or --yes is given)
        --solo      install the solo primary agent (default: ask)
        --auto      install the auto primary agent (default: ask)
        --no-solo   skip the solo primary agent (default: ask)
@@ -183,6 +211,7 @@ for arg in "$@"; do
   case "$arg" in
     -y|--yes) ASSUME_YES=1 ;;
     --force-key) FORCE_KEY=1 ;;
+    --minimal) MINIMAL=1 ;;
     --solo) INSTALL_SOLO=1 ;;
     --auto) INSTALL_AUTO=1 ;;
     --no-solo) INSTALL_SOLO=0 ;;
@@ -204,6 +233,31 @@ done
 if [[ -z "$PY" ]]; then
   echo "ERROR: python3 is required (Windows: install Python from python.org)." >&2
   exit 1
+fi
+
+# Install mode. --minimal ships no agents, so it cannot be combined with a
+# primary; any agent flag or --yes means the full install (which keeps --yes
+# doing what it always did: full setup, no primaries).
+if [[ $MINIMAL -eq 1 ]]; then
+  if [[ $INSTALL_SOLO -eq 1 || $INSTALL_AUTO -eq 1 ]]; then
+    echo "ERROR: --minimal installs no agents — it cannot be combined with --solo/--auto." >&2
+    exit 2
+  fi
+elif [[ $INSTALL_SOLO -ne 2 || $INSTALL_AUTO -ne 2 || $ASSUME_YES -eq 1 ]]; then
+  MINIMAL=0
+elif [[ -t 0 ]]; then
+  read -r -p "Minimal install — SAIA provider + plugin only, no agents/commands? [y/N] " reply
+  if [[ $reply == [yY]* ]]; then
+    MINIMAL=1
+  else
+    MINIMAL=0
+  fi
+else
+  MINIMAL=0
+fi
+if [[ $MINIMAL -eq 1 ]]; then
+  INSTALL_SOLO=0
+  INSTALL_AUTO=0
 fi
 
 if [[ $ASSUME_YES -eq 1 ]]; then
@@ -324,6 +378,11 @@ backup_existing() {  # $1 = backup-relative path, $2 = existing file
 
 write_file() {  # $1 = path relative to CONFIG_DIR; content on stdin
   local rel="$1" dest="$CONFIG_DIR/$1" tmp
+  if [[ $MINIMAL -eq 1 && " ${MINIMAL_FILES[*]} " != *" $rel "* ]]; then
+    cat >/dev/null   # consume the heredoc
+    SKIPPED_FULL+=("$rel")
+    return 0
+  fi
   mkdir -p "$(dirname "$dest")"
   tmp="$(mktemp)"
   cat >"$tmp"
@@ -347,7 +406,11 @@ if [[ $OPENCODE_MISSING -eq 0 ]]; then
   ensure_path_in_shellrc
 fi
 
-log "Installing SAIA config to $CONFIG_DIR"
+if [[ $MINIMAL -eq 1 ]]; then
+  log "Installing the minimal SAIA config (provider + plugin only) to $CONFIG_DIR"
+else
+  log "Installing SAIA config to $CONFIG_DIR"
+fi
 OC_GEN_BODY
 
 # ── Embedded config files ────────────────────────────────────────────
@@ -375,7 +438,7 @@ pack scripts/reload-models.sh
 pack scripts/effort.sh
 
 # Subagent definitions (frontmatter + prompt in one file), auto-discovered by
-# opencode from agent/. These ship unconditionally — the install-time filter
+# opencode from agent/. These ship with every non --minimal install — the filter
 # only ever touches the two optional primaries in opencode.jsonc.
 for a in "${AGENT_FILES[@]}"; do pack "$a"; done
 
@@ -510,11 +573,13 @@ filter_opencode_jsonc() {
     return 0
   fi
 
-  ( umask 077; $PY - "$input" "$INSTALL_SOLO" "$INSTALL_AUTO" <<'PYEOF'
+  ( umask 077; $PY - "$input" "$INSTALL_SOLO" "$INSTALL_AUTO" "$MINIMAL" "$MINIMAL_DEFAULT_MODEL" <<'PYEOF'
 import json, re, sys
 input_path = sys.argv[1]
 install_solo = int(sys.argv[2])
 install_auto = int(sys.argv[3])
+minimal = int(sys.argv[4])
+default_model = sys.argv[5]
 
 # Strip JSONC comments (// line comments) before parsing
 with open(input_path) as fh:
@@ -529,6 +594,14 @@ for line in lines:
 content = '\n'.join(cleaned)
 
 data = json.loads(content)
+
+# --minimal: the provider block and nothing else (no instructions, no agent
+# stubs), plus a default model so opencode starts on SAIA. Derived from the
+# same opencode.jsonc, so the provider block (chunkTimeout invariant included)
+# has one source.
+if minimal == 1:
+    data = {k: data[k] for k in ("$schema", "provider") if k in data}
+    data["model"] = default_model
 
 agent = data.get("agent", {})
 
@@ -546,7 +619,7 @@ if install_auto == 0 and "auto" in agent:
 
 # Clean up empty agent dict
 if not agent:
-    del data["agent"]
+    data.pop("agent", None)
 else:
     data["agent"] = agent
 
@@ -560,7 +633,11 @@ os.replace(input_path + ".tmp", input_path)
 PYEOF
   )
   chmod 644 "$input"
-  log "  filtered: $input (solo=$INSTALL_SOLO, auto=$INSTALL_AUTO)"
+  if [[ $MINIMAL -eq 1 ]]; then
+    log "  filtered: $input (minimal: provider only, model=$MINIMAL_DEFAULT_MODEL)"
+  else
+    log "  filtered: $input (solo=$INSTALL_SOLO, auto=$INSTALL_AUTO)"
+  fi
 }
 
 # Clean up prompt files that are disabled
@@ -570,12 +647,13 @@ cleanup_disabled_prompts() {
   # its own agent/*.md and always installs. The old cross-conditions here were
   # the install-time coupling — including the bug where "--auto --no-solo" left
   # auto's mandatory @debugger validator undefined.
-  if [[ $INSTALL_SOLO -eq 0 ]]; then
+  # (--minimal: remove_full_only_files handles both prompts, with a backup.)
+  if [[ $INSTALL_SOLO -eq 0 && $MINIMAL -eq 0 ]]; then
     rm -f "$CONFIG_DIR/prompts/solo.md"
     log "  removed (disabled): prompts/solo.md"
   fi
 
-  if [[ $INSTALL_AUTO -eq 0 ]]; then
+  if [[ $INSTALL_AUTO -eq 0 && $MINIMAL -eq 0 ]]; then
     rm -f "$CONFIG_DIR/prompts/auto.md"
     log "  removed (disabled): prompts/auto.md"
   fi
@@ -587,6 +665,28 @@ cleanup_disabled_prompts() {
       rm -f "$CONFIG_DIR/prompts/$stale.md"
       log "  removed (superseded by agent/$stale.md): prompts/$stale.md"
     fi
+  done
+}
+
+# --minimal over an earlier full install: back up and delete exactly the files
+# the full install ships (SKIPPED_FULL, recorded by write_file), then any
+# directory that left empty. A user's own files (e.g. a self-written
+# agent/foo.md) are not in that list and stay.
+remove_full_only_files() {
+  [[ $MINIMAL -eq 1 ]] || return 0
+  local rel d
+  # ${a[@]+...}: an empty array is "unbound" under set -u in bash < 4.4 (macOS)
+  for rel in ${SKIPPED_FULL[@]+"${SKIPPED_FULL[@]}"}; do
+    [[ -e "$CONFIG_DIR/$rel" ]] || continue
+    backup_existing "$rel" "$CONFIG_DIR/$rel"
+    rm -f "$CONFIG_DIR/$rel"
+    log "  removed (not part of --minimal): $rel"
+    d="$(dirname "$rel")"
+    while [[ $d != "." ]]; do
+      rmdir "$CONFIG_DIR/$d" 2>/dev/null || break
+      log "  removed empty dir: $d/"
+      d="$(dirname "$d")"
+    done
   done
 }
 
@@ -614,6 +714,14 @@ verify() {
       log "Previous files were backed up to $BACKUP_DIR"
     fi
     log ""
+    if [[ $MINIMAL -eq 1 ]]; then
+      log "Next steps: run 'opencode' — it starts on $MINIMAL_DEFAULT_MODEL with the"
+      log "built-in agents (build, plan); switch SAIA models with /models."
+      log "The plugin caches the model list for ~7 days; to refresh it sooner,"
+      log "delete ~/.cache/opencode/saia-gwdg-models.json and restart opencode."
+      log "Rerun this installer without --minimal for the subagents and commands."
+      return 0
+    fi
     if [[ $INSTALL_SOLO -eq 1 ]] && [[ $INSTALL_AUTO -eq 1 ]]; then
       log "Next steps: run 'opencode', press Tab until the 'solo' agent (default"
       log "workhorse) or 'auto' (orchestrator for big tasks) is selected, and give"
@@ -643,12 +751,15 @@ verify() {
   fi
 }
 
-chmod 755 "$CONFIG_DIR/scripts/reload-models.sh" "$CONFIG_DIR/scripts/usage.sh" "$CONFIG_DIR/scripts/effort.sh"
+if [[ $MINIMAL -eq 0 ]]; then   # --minimal writes no scripts (set -e!)
+  chmod 755 "$CONFIG_DIR/scripts/reload-models.sh" "$CONFIG_DIR/scripts/usage.sh" "$CONFIG_DIR/scripts/effort.sh"
+fi
 setup_auth_key
 setup_extra_keys
 filter_opencode_jsonc
 fix_instructions_path
 cleanup_disabled_prompts
+remove_full_only_files
 verify
 OC_GEN_FOOTER
 

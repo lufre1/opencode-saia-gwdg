@@ -13,7 +13,7 @@ GWDG_API_KEY="your-key" bash setup-saia-opencode.sh    # or run without the env 
 What it does:
 
 1. Checks for `opencode` (also looks in `~/.opencode/bin`); if missing, offers to run the official installer (`curl -fsSL https://opencode.ai/install | bash`).
-2. Writes `opencode.jsonc`, `plugin/saia-gwdg-plugin.js`, `command/*.md`, `scripts/*.sh`, `yagni.md`, all `agent/*.md`, and the selected primaries' `prompts/*.md` into `~/.config/opencode/` (using those auto-discovered folders). Files that would be overwritten are backed up to `~/.config/opencode.bak-<timestamp>/` first; unchanged files are left alone (rerunning is safe).
+2. Writes `opencode.jsonc`, `plugin/saia-gwdg-plugin.js`, `command/*.md`, `scripts/*.sh`, `yagni.md`, all `agent/*.md`, and the selected primaries' `prompts/*.md` into `~/.config/opencode/` (using those auto-discovered folders; with `--minimal`, only the first two — see [Minimal install](#minimal-install---minimal)). Files that would be overwritten are backed up to `~/.config/opencode.bak-<timestamp>/` first; unchanged files are left alone (rerunning is safe).
 3. Writes the API key to `~/.local/share/opencode/auth.json` (chmod 600) as `{"saia-gwdg": {"type": "api", "key": "..."}}`, merging into an existing auth.json rather than clobbering other providers. An existing saia-gwdg key is kept unless `--force-key` is passed.
 4. Verifies by running `opencode models` and checking that `saia-gwdg/` models are listed (costs 1 request of the shared GWDG rate budget: 2/10s, 200/hour per key).
 
@@ -57,14 +57,14 @@ type plain `bash setup-saia-opencode.sh` in cmd/PowerShell: that is usually WSL'
 
 Only the two **primary** agents are optional. The four subagents (`@coder`,
 `@coder2`, `@researcher`, `@debugger`) are auto-discovered `agent/*.md` files and
-always install, whichever primaries you pick — they are usable from any primary,
-including the built-in `build` agent.
+install with every full (non-`--minimal`) setup, whichever primaries you pick —
+they are usable from any primary, including the built-in `build` agent.
 
 Primary selection defaults to opt-in:
 
-- **Interactive mode (default)**: Prompts for each primary (solo, auto)
-- **Non-interactive (`--yes`)**: Skips both primaries
-- **Explicit flags**: Use `--solo`, `--auto`, `--no-solo`, `--no-auto` to control
+- **Interactive mode (default)**: First asks whether to do a [minimal install](#minimal-install---minimal) (provider only); if not, prompts for each primary (solo, auto)
+- **Non-interactive (`--yes`)**: Full setup, skips both primaries
+- **Explicit flags**: Use `--solo`, `--auto`, `--no-solo`, `--no-auto` to control (any of them, or `--yes`, skips the minimal question)
 
 ```bash
 # Install with only the solo primary
@@ -78,10 +78,14 @@ GWDG_API_KEY="key" bash setup-saia-opencode.sh --yes
 
 # Non-interactive: install auto only, skip solo
 GWDG_API_KEY="key" bash setup-saia-opencode.sh --yes --auto
+
+# Only the SAIA provider + plugin — no agents, no commands
+GWDG_API_KEY="key" bash setup-saia-opencode.sh --minimal
 ```
 
 Flags:
-- `-y, --yes` — non-interactive mode (skips both primaries)
+- `-y, --yes` — non-interactive mode (full setup, skips both primaries)
+- `--minimal` — SAIA provider + plugin only (see [below](#minimal-install---minimal)); cannot be combined with `--solo`/`--auto`
 - `--solo` — install the solo primary agent (default: ask)
 - `--auto` — install the auto primary agent (default: ask)
 - `--no-solo` — skip the solo primary agent (default: ask)
@@ -141,7 +145,7 @@ To override one subagent's setting on a single machine, add just that key to
 `~/.config/opencode/agent/<name>.md`'s frontmatter — the file is the whole
 definition, so nothing else has to be copied.
 
-## Minimal install (no custom primaries)
+## Install without custom primaries (`--yes`)
 
 To install without the `solo`/`auto` primaries, use:
 
@@ -158,3 +162,38 @@ This installs:
 `build` can task the subagents directly (opencode allows `task` by default), so
 this is a working setup rather than a bare provider install. Re-run the installer
 with `--solo`/`--auto` later to add the orchestration workflows.
+
+## Minimal install (`--minimal`)
+
+Just the SAIA models in stock opencode, nothing else:
+
+```bash
+GWDG_API_KEY="your-key" bash setup-saia-opencode.sh --minimal
+```
+
+(Windows: `setup-saia-opencode.cmd --minimal`, or answer `y` to the first
+question when double-clicking it.)
+
+This installs only:
+- `opencode.jsonc` with the `saia-gwdg` provider block and a default model
+  (`"model": "saia-gwdg/…"`, the plugin's first choice for `build`), so opencode
+  starts on SAIA — switch models with `/models`
+- `plugin/saia-gwdg-plugin.js` — on opencode v2 it is what registers the live
+  SAIA model list and hands the provider its API key, and it paces requests to
+  the 2 req/10s limit, rotates failover keys, retries stalls and auto-resumes
+  failed turns
+- the API key (plus `GWDG_API_KEYS_EXTRA`, if set), as in the full install
+
+Not installed: the subagents, `/usage`, `/effort`, `/reload_models` and their
+scripts, the `solo`/`auto` primaries, and `yagni.md`. You get opencode's
+built-in agents (`build`, `plan`, `general`, `explore`). Reasoning effort stays
+at the plugin default (`high`). The model list is cached for ~7 days; to
+refresh it sooner, delete `~/.cache/opencode/saia-gwdg-models.json` and restart
+opencode.
+
+`--minimal` **replaces** `~/.config/opencode/opencode.jsonc` (the old one is
+backed up, as always). Run over an earlier full install, it also backs up and
+removes exactly the files that install shipped (`agent/coder.md`,
+`command/usage.md`, …) and the folders that leaves empty. Files of your own,
+such as a self-written `agent/foo.md`, stay. To go back to the full setup,
+rerun the installer without `--minimal`.

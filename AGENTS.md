@@ -14,7 +14,7 @@ The repo mirrors the installed `~/.config/opencode` layout using opencode's auto
 | `plugin/saia-gwdg-plugin.js` | Runtime plugin (auto-discovered): live model list, request pacer (incl. reasoning-effort injection), budget tracking, prompt injection |
 | `command/*.md` | Slash commands `/usage`, `/reload_models`, `/effort` (auto-discovered) |
 | `scripts/{usage,reload-models,effort}.sh` | Backing shell scripts the commands invoke (referenced by absolute path) |
-| `agent/*.md` | The four **subagents** — frontmatter (same schema as an `opencode.jsonc` agent block) + prompt body in one file; auto-discovered by opencode from `{agent,agents}/**/*.md`, so they install unconditionally and are never touched by the installer's agent filter |
+| `agent/*.md` | The four **subagents** — frontmatter (same schema as an `opencode.jsonc` agent block) + prompt body in one file; auto-discovered by opencode from `{agent,agents}/**/*.md`, so they install with every full setup and are never touched by the installer's agent filter (only `--minimal` leaves them out) |
 | `prompts/` | System prompts for the two optional primaries only (`auto.md`, `solo.md`), via `{file:./prompts/*.md}`; the plugin also reads `../prompts/{auto,solo}.md` for budget injection. Subagent prompts are the bodies of their `agent/*.md` |
 | `tool/`, `skill/` | Scaffolds (with READMEs) for future opencode custom tools / skills |
 | `yagni.md` | Global instruction appended to every agent (via `instructions`) |
@@ -43,7 +43,7 @@ The repo mirrors the installed `~/.config/opencode` layout using opencode's auto
 
 - **Primary agents** (`build`, `plan`, `solo`, `auto`): Press `Tab` to switch
 - **`solo` is the default workhorse** (~5-12 requests/task): one full-context session that plans, implements, self-checks, then tasks `@debugger` for independent validation. Use `auto` only for big/ambiguous multi-file tasks where deep upfront planning (deepseek researcher) is worth the chain's ~40% coordination overhead (~20-40 requests/task)
-- **Subagents** (`coder`, `coder2`, `researcher`, `debugger`): Invoke with `@coder`, `@coder2`, `@researcher`, or `@debugger` in your message; `coder2` (different model family) exists for fix rounds. They are defined in `agent/*.md`, install unconditionally, and are taskable from any primary that does not deny them — including the built-in `build` agent, since opencode's native ruleset allows `task` by default. Adding a subagent means adding one `agent/<name>.md` plus a `ROLE_MODELS` entry — no primary needs editing
+- **Subagents** (`coder`, `coder2`, `researcher`, `debugger`): Invoke with `@coder`, `@coder2`, `@researcher`, or `@debugger` in your message; `coder2` (different model family) exists for fix rounds. They are defined in `agent/*.md`, install with every full (non-`--minimal`) setup, and are taskable from any primary that does not deny them — including the built-in `build` agent, since opencode's native ruleset allows `task` by default. Adding a subagent means adding one `agent/<name>.md` plus a `ROLE_MODELS` entry — no primary needs editing
 
 ### Auto Mode Workflow
 
@@ -71,6 +71,7 @@ When you press `Tab` to select `auto` and give it a task, it runs a 5-phase loop
 - Built-in agents (`build`, `plan`) remain available alongside custom agents
 - Native subagents (`general`, `explore`) are declared as `{}` stubs in `opencode.jsonc` **only** so the plugin's `ROLE_MODELS` can pin them a SAIA model. Never give them an `agent/*.md` file: opencode assigns `prompt = <file body>` unconditionally, so an empty body would replace their built-in system prompts with `""`
 - **The installer's agent filter only ever deletes the two primaries** (`solo`, `auto`) from `opencode.jsonc`. The four SAIA subagents live in `agent/*.md` and are not represented in that file at all, so declining both primaries still yields a complete set of subagents driving the built-in `build`/`plan` agents
+- **`--minimal` installs only `opencode.jsonc` + the plugin.** `write_file` in the installer skips every packed file not in `MINIMAL_FILES` and records it; `remove_full_only_files` then backs up and deletes exactly those over an earlier full install. The minimal `opencode.jsonc` is derived from the full one by the install-time filter (keeps `$schema` + `provider`, adds `"model"` = `ROLE_MODELS.build[0]`, read from the plugin by `build-setup.sh`)
 
 ## Commands
 

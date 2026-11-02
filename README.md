@@ -13,6 +13,9 @@ GWDG_API_KEY="your-key" bash setup-saia-opencode.sh
 On Windows, run `setup-saia-opencode.cmd` (next to the `.sh`; needs Git for Windows + Python).
 Or see `SETUP.md` for detailed instructions and agent selection options.
 
+Only want the SAIA models in stock opencode? `--minimal` installs just the provider +
+plugin — no agents, no slash commands (see `SETUP.md`).
+
 ## Files
 
 The repo mirrors the installed `~/.config/opencode` layout and uses opencode's

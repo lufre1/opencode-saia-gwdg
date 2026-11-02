@@ -1,7 +1,8 @@
 @echo off
 rem setup-saia-opencode.cmd - Windows launcher for setup-saia-opencode.sh.
 rem Keep both files in the same folder; arguments are passed through
-rem (e.g. setup-saia-opencode.cmd --solo --auto).
+rem (e.g. setup-saia-opencode.cmd --solo --auto, or --minimal for the
+rem SAIA provider only).
 rem
 rem Runs the installer under Git Bash, the same bash opencode uses on Windows.
 rem Deliberately NOT plain "bash": on Windows that is usually WSL's
