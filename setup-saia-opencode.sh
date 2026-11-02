@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit 79982b9-dirty, packed 2026-11-02T18:58:28Z
+# Source: opencode-config commit 25eb707, packed 2026-11-02T19:00:13Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — always installed, as
