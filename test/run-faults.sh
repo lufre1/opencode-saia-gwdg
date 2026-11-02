@@ -10,8 +10,8 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-LIVE_PLUGIN="$HOME/.config/opencode/plugin/saia-gwdg-plugin.js"
 OC="$HOME/.opencode/bin/opencode"
+REAL_HOME="$HOME"
 PORT="${FAKE_SAIA_PORT:-8787}"
 WORK="$(mktemp -d)"
 WORK_LOG="$WORK/pacer.log"
@@ -30,9 +30,19 @@ pass=0; fail=0
 cleanup() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-# XDG_CONFIG_HOME is not honoured for opencode's global config dir, so the
-# plugin under test has to be the installed one.
-cp "$REPO/plugin/saia-gwdg-plugin.js" "$LIVE_PLUGIN"
+# Hermetic HOME: a copy of the installed config with the repo's plugin, a
+# FAKE SAIA key and the real models cache. The live install is never touched,
+# and even a request that escaped the redirect could only ever be a 401 —
+# never a spent SAIA request. Every run uses `--standalone` (opencode v2), so
+# the env below reaches the server process instead of the shared background
+# service.
+FAKE_HOME="$WORK/home"
+mkdir -p "$FAKE_HOME/.config" "$FAKE_HOME/.local/share/opencode" "$FAKE_HOME/.cache/opencode"
+cp -r "$REAL_HOME/.config/opencode" "$FAKE_HOME/.config/opencode"
+rm -rf "$FAKE_HOME/.config/opencode/node_modules"
+cp "$REPO/plugin/saia-gwdg-plugin.js" "$FAKE_HOME/.config/opencode/plugin/saia-gwdg-plugin.js"
+printf '{"saia-gwdg":{"type":"api","key":"FAKE-KEY-run-faults"}}\n' > "$FAKE_HOME/.local/share/opencode/auth.json"
+cp "$REAL_HOME/.cache/opencode/saia-gwdg-models.json" "$FAKE_HOME/.cache/opencode/" 2>/dev/null || true
 
 start_server() { # $1 = mode
   FAKE_SAIA_MODE="$1" FAKE_SAIA_PORT="$PORT" python3 "$REPO/test/fake-saia.py" >"$WORK/server-$1.log" 2>&1 &
@@ -46,12 +56,15 @@ stop_server() { [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev
 # The early timeout is clamped to SAIA_TIMEOUT_MS by the plugin, so passing the
 # same value in both columns reproduces the old flat-deadline behaviour and
 # leaves the pre-existing rows asserting exactly what they always did.
+# headers-stall-toolcall: on opencode v2 the turn is re-planned by opencode's
+# own retry (logged as opencode-retry) long before it would give up and let
+# auto-resume act; on v1 auto-resume did it. Either is the re-plan we want.
 CASES=$(cat <<'TABLE'
 ok|45000|45000|4|60|stream-done	resp 200 .*remaining=1/min 199/hour 399/day
 slow|45000|45000|4|150|stream-done .*total=[6-9][0-9]{4}ms	!stream-fail	!stream-error
 headers-stall|5000|5000|4|120|stream-stall	stream-retry .*anchor=[1-9]	stream-error .*retryable=true
 headers-stall-long|5000|5000|4|150|stream-retry .*truncated=true	!stream-truncated
-headers-stall-toolcall|5000|5000|4|150|stream-toolcall-abandon	auto-resume scheduled	!stream-retry
+headers-stall-toolcall|5000|5000|4|150|stream-toolcall-abandon	auto-resume scheduled|opencode-retry session=	!stream-retry
 late-error|5000|5000|4|60|stream-late-error-ignored	!stream-fail
 accept-silent|5000|5000|4|120|fail TimeoutError .*retrying=true	fail TimeoutError .*retrying=false	transport-fail-marker
 empty-200|5000|5000|4|120|stream-stall .*timeout=5000ms	!timeout=10000ms
@@ -73,7 +86,10 @@ run_mode() {
   start_line=$(wc -l < "$LOG")
   echo "=== $mode (SAIA_TIMEOUT_MS=$timeout_ms early=$early_ms breaker_min=$breaker_min, allow ${secs}s)"
   start_server "$mode" || { fail=$((fail+1)); return; }
-  ( cd "$WORK" && \
+  mkdir -p "$WORK/proj"
+  ( cd "$WORK/proj" && \
+    HOME="$FAKE_HOME" \
+    OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 \
     SAIA_TEST_HOST=127.0.0.1 \
     SAIA_BASE_URL="http://127.0.0.1:$PORT/v1" \
     SAIA_PACER_LOG="$WORK_LOG" \
@@ -81,7 +97,7 @@ run_mode() {
     SAIA_TIMEOUT_MS="$timeout_ms" \
     SAIA_EARLY_TIMEOUT_MS="$early_ms" \
     SAIA_BREAKER_MIN_TIMEOUTS="$breaker_min" \
-    timeout "$secs" "$OC" run -m "$MODEL" --agent build "reply with the single word hi" \
+    timeout "$secs" "$OC" run --standalone -m "$MODEL" --agent build "reply with the single word hi" \
     >"$WORK/$mode.out" 2>&1 </dev/null )
   stop_server
   local delta="$WORK/$mode.pacer"

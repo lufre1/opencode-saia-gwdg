@@ -14,14 +14,15 @@ This file provides guidance to Claude Code when working with this opencode SAIA 
 - **Model-health breaker:** a model that fails to send headers on `MODEL_BREAKER_MIN_TIMEOUTS` (4, override `SAIA_BREAKER_MIN_TIMEOUTS`) tries within 10 min, at a >=50% failure ratio, is swapped for the next entry in its `ROLE_MODELS` list (or `BREAKER_FALLBACK_MODEL` if it is in none). Logged as `model-unhealthy` / `model-substitute`, toasted once, re-probed after 15 min
 - **Body timeout:** `SAIA_BODY_TIMEOUT_MS` (default 60000, floor 5000) — non-streaming bodies only (`/v1/models`, error bodies). Streaming bodies are guarded by the idle timers instead
 - **Auto-resume:** on by default; `SAIA_AUTO_RESUME=0` disables it, `SAIA_RESUME_ON_ABORT=1` also resumes `MessageAbortedError` within 10s of a transport failure (off by default — it would override a user's Esc). Max 3 per session, 8/hour globally, backoff 5s/20s/60s, refused when the budget is low
-- **Fault injection:** `bash test/run-faults.sh [mode]` — drives `test/fake-saia.py` through the stall/timeout/500 matrix via `SAIA_TEST_HOST` + `SAIA_BASE_URL`. Zero real SAIA requests, and it runs against a private `SAIA_PACER_LOG`/`SAIA_BUDGET_PATH` under its temp dir so a concurrently running opencode neither pollutes the assertions nor gets its budget snapshot overwritten
+- **Fault injection:** `bash test/run-faults.sh [mode]` — drives `test/fake-saia.py` through the stall/timeout/500 matrix via `SAIA_TEST_HOST` + `SAIA_BASE_URL`, one `opencode run --standalone` per mode. Zero real SAIA requests: it runs under a private `HOME` (copy of the installed config + the repo plugin + a **fake** key), so it never touches the live install, and a private `SAIA_PACER_LOG`/`SAIA_BUDGET_PATH`
+- **Unit tests:** `node test/v2-setup.mjs` (the v2 `setup(ctx)` front-end against a fake ctx: models, wire templating, test-mode routing, event-driven auto-resume) and `node test/local-echo.mjs` (the `/effort` short-circuit). Both run against the fake server only
 
 ## Architecture
 
 The repo uses opencode's auto-discovered folders (installed 1:1 into `~/.config/opencode`).
 
 1. `opencode.jsonc` — static config (provider + the **primary** agents `solo`/`auto`, plus model-pinning stubs for `plan`/`build`/`general`/`explore`; no `plugin`/`command` blocks)
-2. `plugin/saia-gwdg-plugin.js` — runtime plugin, **auto-discovered** from `plugin/` (model list, budget tracking, prompt injection)
+2. `plugin/saia-gwdg-plugin.js` — runtime plugin, **auto-discovered** from `plugin/` (model list, budget tracking, prompt injection). opencode v2 entry point: `export default { id: "saia-gwdg", setup }`; `export const server` is the v1 hook set, kept because `setup` reuses it and the tests drive it
 3. `command/*.md` — slash commands (`/usage`, `/reload_models`, `/effort`), auto-discovered; backed by `scripts/*.sh`
 4. `agent/*.md` — the four **subagents** (`coder`, `coder2`, `researcher`, `debugger`): YAML frontmatter (same schema as an `opencode.jsonc` agent block) + the prompt as the body, auto-discovered from `{agent,agents}/**/*.md`. Always installed, independent of which primaries were selected
 5. `prompts/*.md` — system prompts for the two optional primaries only (`auto.md`, `solo.md`); they stay separate files because the plugin templates `__SAIA_BUDGET_STATUS__` into them
@@ -29,12 +30,25 @@ The repo uses opencode's auto-discovered folders (installed 1:1 into `~/.config/
 
 ## Gotchas
 
+### opencode v2 (since 2026-11-02; the installed binary is 2.2.5)
+- v2 loads a plugin **only** from `export default {id, setup(ctx)}` (or `{id, effect}` = an internal Effect-TS function — never point `effect:` at a plain function: that wedged plugin activation and every CLI call then failed with "Location plugins did not finish activating"). The v1 hooks (`config`, `event`, `tool.execute.before`, `client.*`) are never called. `build-setup.sh` fails the build unless there is exactly one `export default { id: "saia-gwdg", setup };`
+- v2 binds `globalThis.fetch` into its HTTP client **after importing plugins but before calling `setup()`**. The pacer is therefore installed at module evaluation (the block at the very end of the plugin — it must stay last, TDZ). Installing it in `setup()` leaves SAIA traffic unpaced, unretried and single-key without any error
+- The config's agents (`opencode.jsonc` + `agent/*.md`) are applied by `opencode.config.agent`, a stage that runs **after** every user plugin, and the agent draft has no `add` — a plugin cannot rewrite them. So `__SAIA_BUDGET_STATUS__`, the coder2 prompt swap and the unready-model remap happen on the wire (`applyWireTemplates`, `role:"system"` messages only)
+- v2 refuses to call a provider without a credential ("No authentication provided") and does not read the v1 `auth.json`; `setup` hands the provider its first key via `provider.transform` (the pacer still rewrites `Authorization` per request). Models are registered with `draft.models.update("saia-gwdg", id, …)`
+- The config's `baseURL` is re-applied after plugins, so in test mode the pacer itself redirects the production host to `SAIA_BASE_URL`; test origins are matched by host **and port** (v2 probes LM Studio/Ollama on localhost)
+- Event mapping for auto-resume: `session.retry.scheduled` → retrying, `session.execution.{failed,interrupted,succeeded}` → errored/aborted/completed turn, `session.inbox.enqueued` (type user) → user message, `session.deleted`. v2 has **no TUI toast** in the plugin API: notices are pacer-log lines (`notice (no TUI toast…)`)
+- The subagent tool is `subagent` (was `task`); the legacy `permission.task` keys in `opencode.jsonc` are migrated by opencode to `subagent` permissions automatically
+- The typings under `~/.config/opencode/node_modules/@opencode-ai/plugin` are 1.18.14 and **stale** — the 2.2.5 binary is the source of truth for the ctx API
+- A shared background service (`opencode service status`) holds the loaded plugin; the installer restarts it. For tests always pass `--standalone`, or the env (`SAIA_BASE_URL`, …) never reaches the server process
+
+### General
+
 - `setup-saia-opencode.sh` is generated — never edit directly; regenerate after any config change
 - Windows support = the same `.sh` under Git Bash, launched by the hand-written `setup-saia-opencode.cmd` (CRLF via `.gitattributes`, kept free of labels/`goto` so an LF copy still parses). Never add a parallel PowerShell installer: the slash commands are bash scripts that opencode runs through Git Bash on Windows anyway. Every script that calls Python resolves it as the first of `python3`/`python`/`py -3` that **runs** (`-c ''`) — `command -v python3` passes on the Microsoft Store stub, which then exits 9009. Python is a hard requirement of the installer (checked before anything is written)
 - Rate limits: 2 req/10s, 200/hour, 400/day, 3000/month shared across all agents (30/min and 1000/day until the 2026-10-27 gateway swap)
 - `permission.task` is resolved **last-match-wins**, so the wildcard MUST come first in both primaries. `agent.auto.permission.task` is allow-by-exception (`"*": "allow"` then `general`/`explore` denied — so a new `agent/*.md` is taskable with no edit); `agent.solo.permission.task` is deny-by-exception (`"*": "deny"` then `debugger` allowed — deliberate: solo's cost contract is ~5-12 requests/task and its roster does not grow)
 - Adding a subagent = adding one `agent/<name>.md` + one `ROLE_MODELS` entry in the plugin. No edit to any primary. Do add it to `prompts/auto.md`'s workflow description if `auto` should actually use it
-- `agent/*.md` bodies get **no** `{file:...}` or `@`-include expansion (opencode substitutes only inside `opencode.json{,c}`) — that is why `coder2`'s prompt is cloned from `coder`'s by the plugin at config time, and why the moved prompts live in the md bodies
+- `agent/*.md` bodies get **no** `{file:...}` or `@`-include expansion (opencode substitutes only inside `opencode.json{,c}`) — that is why `coder2`'s prompt is swapped for `coder`'s by the plugin (on v2 in the outgoing request, `applyWireTemplates`; on v1 in the `config` hook), and why the moved prompts live in the md bodies
 - Never create `agent/general.md` or `agent/explore.md`: opencode assigns `prompt = <file body>` unconditionally, so an empty body would overwrite their built-in system prompts with `""`. Their `{}` stubs in `opencode.jsonc` exist only so `ROLE_MODELS` can pin them a model
 - `mode: subagent` is mandatory in every `agent/*.md` — without it opencode defaults the agent to `mode: "all"` and lists it as a primary in Tab-cycling. `build-setup.sh` fails the build if it is missing
 - Malformed `agent/*.md` frontmatter (e.g. a quoted number for `steps`) is a **fatal** opencode startup error, not a degraded feature — the decode throws inside an uncaught `Effect.promise`

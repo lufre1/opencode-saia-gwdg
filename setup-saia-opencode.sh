@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit 252888f, packed 2026-11-01T18:33:57Z
+# Source: opencode-config commit 79982b9-dirty, packed 2026-11-02T18:58:28Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — always installed, as
@@ -149,10 +149,23 @@ confirm() {
   [[ $reply == [yY]* ]]
 }
 
+# The plugin targets the opencode v2 plugin API (`export default {id, setup}`);
+# opencode 1.x cannot load it.
+check_opencode_version() {
+  local v major
+  v="$(opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  major="${v%%.*}"
+  if [[ -n "$major" ]] && (( major < 2 )); then
+    log "WARNING: opencode $v is older than 2.0 — the SAIA plugin needs opencode >= 2."
+    log "         Run 'opencode upgrade', then rerun this installer."
+  fi
+}
+
 ensure_opencode() {
   export PATH="$HOME/.opencode/bin:$PATH"
   if command -v opencode >/dev/null 2>&1; then
     log "opencode found: $(command -v opencode) ($(opencode --version 2>/dev/null || echo '?'))"
+    check_opencode_version
     return 0
   fi
   if confirm "opencode is not installed. Run the official installer now (curl -fsSL https://opencode.ai/install | bash)?"; then
@@ -535,9 +548,22 @@ const DEFAULT_EFFORT = "high";
 // How long an exhausted bucket keeps a key out of rotation before it is
 // optimistically retried (the true state is learned from the next headers).
 const RESET_TTL_MS = { hour: 60 * 60000, day: 24 * 3600000, month: 30 * 86400000 };
-// Hostnames the pacer intercepts. Exactly the production host unless a test
-// host is exported.
-const SAIA_HOSTS = new Set([SAIA_HOST, ...(SAIA_TEST_HOST ? [SAIA_TEST_HOST] : [])]);
+// Origins the pacer intercepts: the production host, plus — only when a test
+// host is exported — that host on SAIA_BASE_URL's port. Matching the test
+// hostname alone also caught opencode v2's own localhost probes (LM Studio on
+// :1234, Ollama on :11434), which then queued in front of the real request
+// and were sent the SAIA key.
+const SAIA_TEST_ORIGIN_HOST = (() => {
+  if (!SAIA_TEST_HOST) return null;
+  try {
+    const u = new URL(SAIA_BASE_URL);
+    return u.hostname === SAIA_TEST_HOST ? u.host : SAIA_TEST_HOST;
+  } catch {
+    return SAIA_TEST_HOST;
+  }
+})();
+const isSaiaUrl = (url) =>
+  url.hostname === SAIA_HOST || (SAIA_TEST_ORIGIN_HOST !== null && url.host === SAIA_TEST_ORIGIN_HOST);
 
 // Scratch files without permission prompts. opencode already creates
 // join(os.tmpdir(), "opencode") (Global.Path.tmp), pre-approves it under
@@ -941,19 +967,21 @@ function installPacer(keys) {
       return null;
     }
     const last = body?.messages?.[body.messages.length - 1];
-    if (!last) return null;
+    // Only an expanded slash command qualifies: a USER message whose first
+    // line is the sentinel. Matching anywhere in the last message made a tool
+    // result that merely contained the sentinel (a read of the generated
+    // installer, which embeds command/effort.md) swallow the model turn and
+    // return the file dump as the answer — the 2026-11-01 halt.
+    if (last?.role !== "user") return null;
     const text =
       typeof last.content === "string"
         ? last.content
         : Array.isArray(last.content)
           ? last.content.map((p) => p?.text ?? "").join("")
           : "";
-    if (!text.includes(LOCAL_ECHO_SENTINEL)) return null;
-    const echo = text
-      .split("\n")
-      .filter((line) => !line.includes(LOCAL_ECHO_SENTINEL))
-      .join("\n")
-      .trim();
+    const lines = text.split("\n");
+    if (lines[0].trim() !== LOCAL_ECHO_SENTINEL) return null;
+    const echo = lines.slice(1).join("\n").trim();
     pacerDebugLog("local echo for /effort — no SAIA request");
     const id = "chatcmpl-local-echo";
     const created = Math.floor(Date.now() / 1000);
@@ -1025,10 +1053,21 @@ function installPacer(keys) {
     } catch {
       return realFetch(input, init);
     }
-    if (!SAIA_HOSTS.has(url.hostname)) return realFetch(input, init);
+    // Test mode: never let a request reach the production endpoint. opencode
+    // v2 re-applies the config's baseURL after every plugin, so the provider
+    // keeps pointing at SAIA even when SAIA_BASE_URL is set; redirect here.
+    if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL && url.hostname === SAIA_HOST) {
+      const prodPath = new URL(SAIA_PROD_BASE_URL).pathname.replace(/\/$/, "");
+      const test = new URL(SAIA_BASE_URL);
+      const rest = url.pathname.startsWith(prodPath) ? url.pathname.slice(prodPath.length) : url.pathname;
+      url = new URL(`${test.origin}${test.pathname.replace(/\/$/, "")}${rest}${url.search}`);
+      input = typeof input === "string" || input instanceof URL ? url.href : new Request(url.href, input);
+    }
+    if (!isSaiaUrl(url)) return realFetch(input, init);
 
     const local = tryLocalEcho(init, url);
     if (local) return Promise.resolve(local);
+    if (url.pathname.endsWith("/chat/completions")) init = applyWireTemplates(init);
 
     const enqueuedAt = Date.now();
     const reqId = crypto.randomUUID();
@@ -1713,6 +1752,177 @@ function budgetIsLow(b) {
 // floor still protects the tail).
 const chainStarted = new Set();
 
+// The line baked into the solo/auto prompts in place of __SAIA_BUDGET_STATUS__.
+function budgetStatusLine() {
+  const b = freshBudget();
+  if (b === null) return "UNKNOWN (no recent budget data)";
+  return (
+    (budgetIsLow(b) ? "LOW" : "HEALTHY") +
+    `: ~${b.hour} requests left this hour across ${b.keyCount} key(s), ~${b.day} today, ` +
+    `~${b.month} this month (sustainable pace ≈${100 * b.keyCount}/day)`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Startup inputs shared by the v1 `config` hook and the v2 `setup`.
+
+// auth.json key first, then the optional failover keys from KEYS_PATH, in
+// rotation order. null when there is no SAIA key at all (plugin stays inert).
+function loadSaiaKeys() {
+  let key;
+  try {
+    const auth = JSON.parse(readFileSync(join(homedir(), ".local/share/opencode/auth.json"), "utf-8"));
+    key = auth["saia-gwdg"]?.key;
+  } catch {
+    return null;
+  }
+  if (!key) return null;
+  let keys = [key];
+  try {
+    const extra = JSON.parse(readFileSync(KEYS_PATH, "utf-8"));
+    if (Array.isArray(extra?.keys)) {
+      keys = [...new Set([key, ...extra.keys.filter((k) => typeof k === "string" && k)])];
+    }
+  } catch {}
+  return keys;
+}
+
+// SAIA's /models list: the cache while it is fresh (zero SAIA requests),
+// otherwise a live fetch, otherwise the stale cache. null if nothing works.
+async function loadSaiaModels(key) {
+  let cached;
+  try {
+    cached = JSON.parse(readFileSync(CACHE_PATH, "utf-8"));
+  } catch {}
+  if (typeof cached?.fetchedAt === "number" && Date.now() - cached.fetchedAt < MODELS_TTL_MS && cached.models) {
+    pacerDebugLog(`models: cache hit (age ${((Date.now() - cached.fetchedAt) / 86400000).toFixed(1)}d)`);
+    return cached.models;
+  }
+  try {
+    const resp = await fetch(`${SAIA_BASE_URL}/models`, { headers: { Authorization: `Bearer ${key}` } });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const models = (await resp.json()).data;
+    pacerDebugLog("models: fetched fresh");
+    try {
+      mkdirSync(dirname(CACHE_PATH), { recursive: true });
+      writeFileSync(CACHE_PATH, JSON.stringify({ fetchedAt: Date.now(), models }));
+    } catch {}
+    return models;
+  } catch {
+    pacerDebugLog("models: fetch failed, using stale cache");
+    return cached?.models ?? null;
+  }
+}
+
+// Publishes the ready-model set and the reasoning-capable subset on globals
+// for the pacer (effort injection, unready-model remap). Returns the ready
+// SAIA model records.
+function publishModels(models) {
+  const ready = (models ?? []).filter((m) => m.status === "ready");
+  const reasoning = new Set();
+  for (const m of ready) {
+    if (m.output?.includes("thought") || FORCE_REASONING.has(m.id)) reasoning.add(m.id);
+  }
+  globalThis.__saiaReasoning = reasoning;
+  globalThis.__saiaReady = new Set(ready.map((m) => m.id));
+  return ready;
+}
+
+// Body of an agent/<name>.md (frontmatter stripped, trimmed), cached. The
+// plugin lives in <config>/plugin/, agent/ is a sibling of it.
+const agentBodies = new Map();
+function agentBody(name) {
+  if (agentBodies.has(name)) return agentBodies.get(name);
+  let body = null;
+  try {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const txt = readFileSync(join(dir, "..", "agent", `${name}.md`), "utf-8");
+    const m = txt.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?([\s\S]*)$/);
+    body = (m ? m[1] : txt).trim() || null;
+  } catch {}
+  agentBodies.set(name, body);
+  return body;
+}
+
+// ---------------------------------------------------------------------------
+// Wire-level templating (opencode v2).
+//
+// On v1 the `config` hook rewrote agent prompts and models before opencode
+// used them. v2 applies the config's agents in a stage AFTER every user
+// plugin, so a plugin can no longer touch them; the same three rewrites are
+// done here, on the outgoing request, instead. On v1 each one is a no-op:
+// the placeholder is already gone, coder2 already carries coder's prompt, and
+// every agent is already pinned to a ready model.
+//
+// Only role:"system" messages are touched. A tool result or user message can
+// legitimately quote the placeholder or a prompt file (reading prompts/auto.md,
+// or the generated installer) and must reach the model verbatim.
+let warnedCoder2 = false;
+function applyWireTemplates(init) {
+  let body;
+  try {
+    body = JSON.parse(init?.body);
+  } catch {
+    return init;
+  }
+  if (!body || !Array.isArray(body.messages)) return init;
+  let changed = false;
+
+  const coder2 = agentBody("coder2");
+  const coder = agentBody("coder");
+  const rewrite = (text) => {
+    let out = text;
+    if (out.includes("__SAIA_BUDGET_STATUS__")) {
+      out = out.replaceAll("__SAIA_BUDGET_STATUS__", budgetStatusLine());
+    }
+    // @coder2 is @coder on another model family; the two share coder's
+    // prompt (agent/*.md bodies get no include expansion, so it is swapped
+    // in here rather than duplicated into agent/coder2.md).
+    if (coder2 && coder && coder2 !== coder && out.includes(coder2)) {
+      out = out.replace(coder2, coder);
+    }
+    return out;
+  };
+  for (const msg of body.messages) {
+    if (msg?.role !== "system") continue;
+    if (typeof msg.content === "string") {
+      const next = rewrite(msg.content);
+      if (next !== msg.content) {
+        msg.content = next;
+        changed = true;
+      }
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (typeof part?.text !== "string") continue;
+        const next = rewrite(part.text);
+        if (next !== part.text) {
+          part.text = next;
+          changed = true;
+        }
+      }
+    }
+  }
+  if (changed) pacerDebugLog(`wire-template applied model=${body.model}`);
+  else if (!warnedCoder2 && coder2 && body.messages.some((m) => m?.role === "system" && String(m.content).includes("# Coder 2"))) {
+    warnedCoder2 = true;
+    pacerDebugLog("wire-template: coder2 system prompt seen but its body did not match agent/coder2.md verbatim");
+  }
+
+  // ROLE_MODELS pinning: an agent configured for a model SAIA currently lists
+  // as not ready is moved to the first ready model of that model's role.
+  const ready = globalThis.__saiaReady;
+  if (ready?.size && typeof body.model === "string" && !ready.has(body.model)) {
+    const role = roleOf(body.model);
+    const pick = (role && ROLE_MODELS[role].find((m) => ready.has(m))) || [...ready][0];
+    if (pick && pick !== body.model) {
+      pacerDebugLog(`model-unready ${body.model} -> ${pick}${role ? ` (role ${role})` : ""}`);
+      body.model = pick;
+      changed = true;
+    }
+  }
+  return changed ? { ...init, body: JSON.stringify(body) } : init;
+}
+
 // ---------------------------------------------------------------------------
 // Session auto-resume.
 //
@@ -2182,65 +2392,15 @@ export const server = async (input) => {
     },
 
     config: async (config) => {
-      let key;
-      try {
-        const authPath = join(homedir(), ".local/share/opencode/auth.json");
-        const auth = JSON.parse(readFileSync(authPath, "utf-8"));
-        key = auth["saia-gwdg"]?.key;
-      } catch {
-        return;
-      }
-
-      if (!key) return;
-
-      // Optional failover keys: KEYS_PATH holds {"keys": ["...", ...]} in
-      // rotation order after the auth.json key (always #1). A missing or
-      // unreadable file means single-key behavior, exactly as before.
-      let keys = [key];
-      try {
-        const extra = JSON.parse(readFileSync(KEYS_PATH, "utf-8"));
-        if (Array.isArray(extra?.keys)) {
-          keys = [...new Set([key, ...extra.keys.filter((k) => typeof k === "string" && k)])];
-        }
-      } catch {}
+      // Optional failover keys come from KEYS_PATH, after the auth.json key.
+      const keys = loadSaiaKeys();
+      if (!keys) return;
       installPacer(keys);
       pacerDebugLog(`pacer: ${keys.length} SAIA key(s) in rotation, timeout=${TIMEOUT_MS}ms`);
 
-      let cached;
-      try {
-        cached = JSON.parse(readFileSync(CACHE_PATH, "utf-8"));
-      } catch {}
-
-      let models;
-      if (
-        typeof cached?.fetchedAt === "number" &&
-        Date.now() - cached.fetchedAt < MODELS_TTL_MS &&
-        cached.models
-      ) {
-        models = cached.models; // fresh enough — costs zero SAIA requests
-        pacerDebugLog(
-          `models: cache hit (age ${((Date.now() - cached.fetchedAt) / 86400000).toFixed(1)}d)`
-        );
-      } else {
-        try {
-          const resp = await fetch(`${SAIA_BASE_URL}/models`, {
-            headers: { Authorization: `Bearer ${key}` },
-          });
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          const json = await resp.json();
-          models = json.data;
-          pacerDebugLog("models: fetched fresh");
-          try {
-            mkdirSync(dirname(CACHE_PATH), { recursive: true });
-            writeFileSync(CACHE_PATH, JSON.stringify({ fetchedAt: Date.now(), models }));
-          } catch {}
-        } catch {
-          models = cached?.models; // stale cache beats no models
-          pacerDebugLog("models: fetch failed, using stale cache");
-        }
-      }
-
+      const models = await loadSaiaModels(keys[0]);
       if (!models) return;
+      publishModels(models);
 
       if (!config.provider) config.provider = {};
       if (!config.provider["saia-gwdg"]) {
@@ -2262,17 +2422,12 @@ export const server = async (input) => {
       }
 
       config.provider["saia-gwdg"].models = {};
-      // Reasoning-capable model ids, exposed on the global so the pacer's
-      // per-request effort injection knows which models to apply it to.
-      const reasoningModels = new Set();
       for (const m of models) {
         if (m.status !== "ready") continue;
-        const reasoning = m.output?.includes("thought") || FORCE_REASONING.has(m.id);
-        if (reasoning) reasoningModels.add(m.id);
         config.provider["saia-gwdg"].models[m.id] = {
           name: m.name,
           attachment: m.input?.some((t) => ["image", "audio", "video"].includes(t)),
-          reasoning,
+          reasoning: globalThis.__saiaReasoning.has(m.id),
           // Required for ANY temperature to reach the wire: opencode gates the
           // field on `model.capabilities.temperature`, so without this every
           // agent temperature in opencode.jsonc is silently dropped (verified
@@ -2281,7 +2436,6 @@ export const server = async (input) => {
           temperature: true,
         };
       }
-      globalThis.__saiaReasoning = reasoningModels;
 
       // Resolve each agent's model from ROLE_MODELS against the live list:
       // first preference that is ready wins, otherwise any ready model.
@@ -2305,14 +2459,7 @@ export const server = async (input) => {
       // auto-rejected in non-interactive runs), so the check happens here at
       // startup: read the pacer's last snapshot and bake a status line into
       // the auto prompt via the __SAIA_BUDGET_STATUS__ placeholder.
-      let status = "UNKNOWN (no recent budget data)";
-      const b = freshBudget();
-      if (b !== null) {
-        status =
-          (budgetIsLow(b) ? "LOW" : "HEALTHY") +
-          `: ~${b.hour} requests left this hour across ${b.keyCount} key(s), ~${b.day} today, ` +
-          `~${b.month} this month (sustainable pace ≈${100 * b.keyCount}/day)`;
-      }
+      const status = budgetStatusLine();
       for (const [role, promptFile] of [
         ["auto", "prompts/auto.md"],
         ["solo", "prompts/solo.md"],
@@ -2354,6 +2501,227 @@ export const server = async (input) => {
     },
   };
 };
+// ---------------------------------------------------------------------------
+// opencode v2 front-end.
+//
+// opencode >= 2 loads a plugin ONLY from `export default {id, setup(ctx)}`
+// (or `{id, effect}`, an internal Effect-TS function — never point that at a
+// plain function). The v1 hooks above (`config`, `event`,
+// `tool.execute.before`) are never called by v2, so this adapter re-wires
+// them:
+//
+//   config               -> installPacer + provider.transform (model list);
+//                           agent prompt/model rewrites moved to the wire
+//                           (applyWireTemplates), because v2 applies the
+//                           config's agents AFTER every user plugin
+//   event                -> ctx.event.subscribe, translated to the v1 event
+//                           shapes the resume logic in server() consumes
+//   tool.execute.before  -> ctx.tool.hook("execute.before"); the subagent tool
+//                           is called "subagent" in v2 (was "task")
+//   client.session.*     -> a v1-shaped shim over ctx.session.*
+//   client.tui           -> none in v2: toasts become pacer-log lines
+//
+// `export const server` stays the v1 entry point; the tests drive it directly.
+
+const V2_EVENT_TYPES = [
+  "session.retry.scheduled",
+  "session.step.started",
+  "session.step.ended",
+  "session.step.failed",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.inbox.enqueued",
+  "session.deleted",
+];
+
+// v2 errors are {type, message, ...}; classifyResume speaks the v1
+// {name, data:{message, statusCode, isRetryable}} shape.
+const v2ErrorToV1 = (err) => {
+  if (!err || typeof err !== "object") return { name: "UnknownError", data: { message: String(err ?? "") } };
+  const statusCode = err.statusCode ?? err.status ?? err.data?.statusCode;
+  return {
+    name: statusCode !== undefined ? "APIError" : String(err.type ?? err.name ?? "UnknownError"),
+    data: {
+      message: String(err.message ?? err.data?.message ?? ""),
+      ...(statusCode !== undefined ? { statusCode } : {}),
+      ...(err.retryable !== undefined || err.isRetryable !== undefined
+        ? { isRetryable: err.retryable ?? err.isRetryable }
+        : {}),
+    },
+  };
+};
+
+// Turns one v2 event into the v1 events server().event understands. `turns`
+// remembers, per session, the agent/model/message of the step in flight so a
+// failure can be resumed on the same agent and deduped on its message id.
+const translateV2Event = (evt, turns) => {
+  const d = evt?.data ?? {};
+  const sid = d.sessionID;
+  if (!sid) return [];
+  const turn = turns.get(sid) ?? {};
+  const assistant = (extra) => ({
+    type: "message.updated",
+    properties: {
+      info: {
+        sessionID: sid,
+        role: "assistant",
+        id: turn.messageID ?? evt.id,
+        mode: turn.agent,
+        providerID: turn.model?.providerID,
+        modelID: turn.model?.id,
+        ...extra,
+      },
+    },
+  });
+  switch (evt.type) {
+    case "session.retry.scheduled":
+      // v2 re-runs a failed turn by itself (~10 attempts) before it ever emits
+      // execution.failed, so this — not auto-resume — is usually what recovers
+      // a transport failure. Every attempt also gets the pacer's own tries.
+      pacerDebugLog(
+        `opencode-retry session=${sid} attempt=${d.attempt ?? "?"} ` +
+          `error=${String(d.error?.type ?? "-")} msg=${String(d.error?.message ?? "").slice(0, 100)}`
+      );
+      return [{ type: "session.status", properties: { sessionID: sid, status: { type: "retry" } } }];
+    case "session.step.started":
+      turns.set(sid, { agent: d.agent, model: d.model, messageID: d.assistantMessageID });
+      if (turns.size > 200) turns.delete(turns.keys().next().value);
+      return [{ type: "session.status", properties: { sessionID: sid, status: { type: "busy" } } }];
+    case "session.step.ended":
+    case "session.step.failed":
+      if (d.assistantMessageID) turns.set(sid, { ...turn, messageID: d.assistantMessageID });
+      return [];
+    case "session.execution.succeeded":
+      return [assistant({ time: { completed: Date.now() } }), { type: "session.idle", properties: { sessionID: sid } }];
+    case "session.execution.failed":
+      return [assistant({ error: v2ErrorToV1(d.error) }), { type: "session.idle", properties: { sessionID: sid } }];
+    case "session.execution.interrupted":
+      return [
+        assistant({ error: { name: "MessageAbortedError", data: { message: "interrupted" } } }),
+        { type: "session.idle", properties: { sessionID: sid } },
+      ];
+    case "session.inbox.enqueued":
+      if (d.item?.type !== "user") return [];
+      return [{ type: "message.updated", properties: { info: { sessionID: sid, role: "user", id: d.inboxID } } }];
+    case "session.deleted":
+      turns.delete(sid);
+      return [{ type: "session.deleted", properties: { sessionID: sid } }];
+    default:
+      return [];
+  }
+};
+
+// The slice of the v1 SDK client server() uses, backed by the v2 ctx.
+const v2ClientShim = (ctx) => ({
+  session: {
+    get: async ({ path }) => ({ data: await ctx.session.get({ sessionID: path.id }) }),
+    // v2 has no cheap "last N messages" call. An empty list skips fireResume's
+    // two history checks; the same facts (the user took over, the turn
+    // already recovered) arrive as events and cancel the resume there.
+    messages: async () => ({ data: [] }),
+    promptAsync: async ({ path, body }) =>
+      ctx.session.prompt({
+        sessionID: path.id,
+        text: (body?.parts ?? []).map((p) => p?.text ?? "").join("\n"),
+        metadata: { saia: "auto-resume" },
+      }),
+  },
+  tui: {
+    showToast: async ({ body }) => pacerDebugLog(`notice (no TUI toast in opencode v2): ${body?.message}`),
+  },
+});
+
+const setup = async (ctx) => {
+  const keys = loadSaiaKeys();
+  if (!keys) {
+    pacerDebugLog("v2: no saia-gwdg key in auth.json — plugin inactive");
+    return;
+  }
+  installPacer(keys);
+  pacerDebugLog(`pacer: ${keys.length} SAIA key(s) in rotation, timeout=${TIMEOUT_MS}ms (opencode v2)`);
+
+  const ready = publishModels(await loadSaiaModels(keys[0]));
+  if (ready.length) {
+    await ctx.provider.transform((draft) => {
+      // v2 refuses to call a provider it holds no credential for ("No
+      // authentication provided") and does not read the v1 auth.json. The
+      // pacer rewrites Authorization per request anyway (key rotation), so the
+      // first key here only has to get the request past that gate. A test
+      // baseURL must win too, or fault injection spends real SAIA requests.
+      draft.update("saia-gwdg", (p) => {
+        p.settings = {
+          ...(p.settings ?? {}),
+          apiKey: keys[0],
+          ...(SAIA_BASE_URL !== SAIA_PROD_BASE_URL ? { baseURL: SAIA_BASE_URL } : {}),
+        };
+      });
+      if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
+      for (const m of ready) {
+        draft.models.update("saia-gwdg", m.id, (x) => {
+          x.name = m.name ?? m.id;
+          x.capabilities = {
+            ...(x.capabilities ?? {}),
+            tools: true,
+            // opencode gates every agent temperature on this flag; all SAIA
+            // models are OpenAI-compatible completions endpoints.
+            temperature: true,
+            input: Array.isArray(m.input) && m.input.length ? m.input.filter((t) => ["text", "image", "audio", "video", "pdf"].includes(t)) : ["text"],
+            output: ["text"],
+          };
+        });
+      }
+    });
+    pacerDebugLog(`v2: ${ready.length} SAIA model(s) registered`);
+  } else {
+    pacerDebugLog("v2: no ready SAIA models (no cache, fetch failed) — provider left empty");
+  }
+
+  const hooks = await server({ client: v2ClientShim(ctx), directory: ctx.location?.directory });
+
+  await ctx.tool.hook("execute.before", (input) =>
+    hooks["tool.execute.before"]({ tool: input.tool === "subagent" ? "task" : input.tool, sessionID: input.sessionID }, {})
+  );
+
+  const stop = new AbortController();
+  const turns = new Map();
+  (async () => {
+    try {
+      for await (const evt of ctx.event.subscribe({ types: V2_EVENT_TYPES, signal: stop.signal })) {
+        for (const event of translateV2Event(evt, turns)) {
+          try {
+            await hooks.event({ event });
+          } catch (e) {
+            pacerDebugLog(`v2 event handler failed type=${event.type} msg=${String(e?.message ?? e).slice(0, 160)}`);
+          }
+        }
+      }
+    } catch (e) {
+      if (!stop.signal.aborted) pacerDebugLog(`v2 event stream ended: ${String(e?.message ?? e).slice(0, 160)}`);
+    }
+  })();
+
+  return async () => {
+    stop.abort();
+    await hooks.dispose();
+  };
+};
+
+export default { id: "saia-gwdg", setup };
+
+// opencode v2 binds globalThis.fetch into its HTTP client AFTER importing the
+// plugins but BEFORE calling their setup(): a pacer installed in setup() is
+// never on the request path, and SAIA traffic goes out unpaced, unretried and
+// with only the first key (verified on 2.2.5 with an import-time fetch probe).
+// So the fetch patch goes in at module evaluation. It must stay the LAST
+// statement of this module: installPacer reads consts declared throughout the
+// file, which are in the TDZ until their declarations have run. Idempotent
+// (__saiaPacerInstalled), so the v1 config hook and setup() calling it again
+// only refresh the key list.
+{
+  const keys = loadSaiaKeys();
+  if (keys) installPacer(keys);
+}
 __OC_FILE_EOF__
 
 write_file "yagni.md" <<'__OC_FILE_EOF__'
@@ -3364,6 +3732,13 @@ verify() {
     log "opencode is not installed — skipping verification."
     log "After installing opencode, verify with: opencode models | grep '^saia-gwdg/'"
     return 0
+  fi
+  # opencode v2 runs a shared background service that has the OLD plugin and
+  # config loaded; restart it so it (and `opencode models` below) picks up the
+  # files just written. Interrupts sessions running in that service.
+  if opencode service status >/dev/null 2>&1; then
+    log "Restarting the opencode background service to load the new plugin..."
+    opencode service restart >/dev/null 2>&1 || log "WARNING: 'opencode service restart' failed — restart opencode manually."
   fi
   log ""
   log "Verifying (fetches the GWDG model list — 1 request of the shared rate budget)..."

@@ -74,6 +74,26 @@ for f in "${MANIFEST[@]}"; do
   fi
 done
 
+# The plugin's entry point is the one thing opencode v2 validates at load
+# ("Plugin must export a default definition with an id and an effect or setup
+# function"); a mistake there disables the pacer for every session. Two
+# default exports is a SyntaxError (the 2026-11-02 installer had exactly
+# that), and `effect:` pointed at a plain function wedges plugin activation.
+PLUGIN=plugin/saia-gwdg-plugin.js
+if [[ "$(grep -c '^export default' "$PLUGIN")" -ne 1 ]]; then
+  echo "ERROR: $PLUGIN must have exactly one 'export default' (found $(grep -c '^export default' "$PLUGIN"))" >&2
+  exit 1
+fi
+if ! grep -qE '^export default \{ id: "saia-gwdg", setup \};$' "$PLUGIN"; then
+  echo "ERROR: $PLUGIN default export must be '{ id: \"saia-gwdg\", setup }' (opencode v2 plugin API)" >&2
+  exit 1
+fi
+if command -v node >/dev/null 2>&1; then
+  node --check "$PLUGIN" || { echo "ERROR: $PLUGIN does not parse" >&2; exit 1; }
+else
+  echo "WARNING: node not found — skipping the syntax check of $PLUGIN" >&2
+fi
+
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIRTY=""
 git diff --quiet HEAD -- "${MANIFEST[@]}" 2>/dev/null || DIRTY="-dirty"
@@ -239,10 +259,23 @@ confirm() {
   [[ $reply == [yY]* ]]
 }
 
+# The plugin targets the opencode v2 plugin API (`export default {id, setup}`);
+# opencode 1.x cannot load it.
+check_opencode_version() {
+  local v major
+  v="$(opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  major="${v%%.*}"
+  if [[ -n "$major" ]] && (( major < 2 )); then
+    log "WARNING: opencode $v is older than 2.0 — the SAIA plugin needs opencode >= 2."
+    log "         Run 'opencode upgrade', then rerun this installer."
+  fi
+}
+
 ensure_opencode() {
   export PATH="$HOME/.opencode/bin:$PATH"
   if command -v opencode >/dev/null 2>&1; then
     log "opencode found: $(command -v opencode) ($(opencode --version 2>/dev/null || echo '?'))"
+    check_opencode_version
     return 0
   fi
   if confirm "opencode is not installed. Run the official installer now (curl -fsSL https://opencode.ai/install | bash)?"; then
@@ -563,6 +596,13 @@ verify() {
     log "opencode is not installed — skipping verification."
     log "After installing opencode, verify with: opencode models | grep '^saia-gwdg/'"
     return 0
+  fi
+  # opencode v2 runs a shared background service that has the OLD plugin and
+  # config loaded; restart it so it (and `opencode models` below) picks up the
+  # files just written. Interrupts sessions running in that service.
+  if opencode service status >/dev/null 2>&1; then
+    log "Restarting the opencode background service to load the new plugin..."
+    opencode service restart >/dev/null 2>&1 || log "WARNING: 'opencode service restart' failed — restart opencode manually."
   fi
   log ""
   log "Verifying (fetches the GWDG model list — 1 request of the shared rate budget)..."
