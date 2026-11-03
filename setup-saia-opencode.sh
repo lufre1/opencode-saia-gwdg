@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit 11cae03, packed 2026-11-03T09:08:29Z
+# Source: opencode-config commit a6bbf96, packed 2026-11-03T16:42:13Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — as auto-discovered
@@ -30,7 +30,7 @@ export PYTHONUTF8=1
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 DATA_DIR="$HOME/.local/share/opencode"   # the plugin hardcodes this path
-AUTH_FILE="$DATA_DIR/auth.json"
+AUTH_FILE="$DATA_DIR/auth.json"          # only to move an old key out of it
 BACKUP_DIR=""
 ASSUME_YES=0
 FORCE_KEY=0
@@ -52,7 +52,9 @@ Usage: [GWDG_API_KEY=... GWDG_API_KEYS_EXTRA=key2,key3] bash setup-saia-opencode
 Installs the GWDG SAIA setup for opencode:
   - opencode.jsonc, plugin/, command/, scripts/, agent/*.md, prompts/*.md
     into ~/.config/opencode
-  - API key into ~/.local/share/opencode/auth.json (chmod 600)
+  - API key into opencode's own credential store (opencode auth list) — a
+    key left in ~/.local/share/opencode/auth.json by an older install is
+    moved there and removed from auth.json
   - optional extra failover keys (GWDG_API_KEYS_EXTRA, comma-separated) into
     ~/.local/share/opencode/saia-gwdg-keys.json (chmod 600) — the plugin
     switches to the next key when the active one's rate budget is exhausted
@@ -85,7 +87,9 @@ Options:
 
 The API key is taken from the GWDG_API_KEY environment variable if set,
 otherwise prompted for interactively. Files that would be overwritten are
-backed up to ~/.config/opencode.bak-<timestamp>/ first.
+backed up to ~/.config/opencode.bak-<timestamp>/ first. Without opencode
+installed no key is stored; run 'opencode auth login saia-gwdg --standalone'
+later.
 USAGE
 }
 
@@ -305,6 +309,10 @@ write_file "opencode.jsonc" <<'__OC_FILE_EOF__'
   // Commands live in command/*.md (/usage, /reload_models).
   "provider": {
     "saia-gwdg": {
+      // The section header in the /models picker and the integration's name in
+      // `opencode auth` (opencode copies it to both). The key itself lives in
+      // opencode's credential store: `opencode auth login saia-gwdg`.
+      "name": "SAIA (GWDG)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "https://chat-ai.academiccloud.de/v1",
@@ -480,8 +488,9 @@ const MODELS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // - spaces request starts >= 5100ms apart so the 2-per-10s limit can't trip
 //   (was 30/min until the 2026-10-27 gateway swap)
 // - supports multiple API keys with hard-floor failover: rate limits are
-//   per key, and opencode only knows the auth.json key, so the pacer
-//   rewrites the Authorization header to the active key on every request.
+//   per key, and opencode only knows the one saia-gwdg key in its credential
+//   store (`opencode auth login saia-gwdg`), so the pacer rewrites the
+//   Authorization header to the active key on every request.
 //   When the active key's hour/day/month bucket is nearly empty (or it
 //   429s despite pacing) the pacer switches to the next usable key; an
 //   exhausted key re-enters rotation after its bucket's reset TTL. Extra
@@ -917,13 +926,13 @@ function installPacer(keys) {
       allDead
         ? `All ${all.length} SAIA key(s) rejected by SAIA (${per.join("; ")}) — the key(s) are ` +
           `revoked or expired. Get a new one from https://saia.gwdg.de/ ` +
-          `and update ${join(homedir(), ".local/share/opencode/auth.json")} (extra keys: ${KEYS_PATH}).`
+          `and store it with \`opencode auth login saia-gwdg\` (extra keys: ${KEYS_PATH}).`
         : `All ${all.length} SAIA key(s) nearly exhausted (${per.join("; ")}) — ` +
           `aborting instead of retry-spinning. Wait for the buckets to reset.`
     );
   };
 
-  // Rate limits are per key, but opencode only knows the auth.json key —
+  // Rate limits are per key, but opencode only knows its one stored key —
   // rewrite the Authorization header to the currently active one.
   // NOTE: when both a Request object and an init are passed, init.headers
   // wins in fetch() — so the rewrite must always land on the init side
@@ -1821,25 +1830,33 @@ function budgetStatusLine() {
 // ---------------------------------------------------------------------------
 // Startup inputs shared by the v1 `config` hook and the v2 `setup`.
 
-// auth.json key first, then the optional failover keys from KEYS_PATH, in
-// rotation order. null when there is no SAIA key at all (plugin stays inert).
-function loadSaiaKeys() {
-  let key;
-  try {
-    const auth = JSON.parse(readFileSync(join(homedir(), ".local/share/opencode/auth.json"), "utf-8"));
-    key = auth["saia-gwdg"]?.key;
-  } catch {
-    return null;
-  }
-  if (!key) return null;
-  let keys = [key];
+// The optional failover keys from KEYS_PATH, in rotation order.
+function loadExtraKeys() {
   try {
     const extra = JSON.parse(readFileSync(KEYS_PATH, "utf-8"));
-    if (Array.isArray(extra?.keys)) {
-      keys = [...new Set([key, ...extra.keys.filter((k) => typeof k === "string" && k)])];
-    }
+    if (Array.isArray(extra?.keys)) return extra.keys.filter((k) => typeof k === "string" && k);
   } catch {}
-  return keys;
+  return [];
+}
+
+// opencode's stored saia-gwdg key first, then the failover keys. null without
+// a stored key (plugin stays inert).
+function saiaKeys(storedKey) {
+  return storedKey ? [...new Set([storedKey, ...loadExtraKeys()])] : null;
+}
+
+// The active saia-gwdg key in opencode's own credential store, where
+// `opencode auth login saia-gwdg` and the installer (`opencode auth import`)
+// put it. Only reachable through the v2 ctx, so never before setup().
+async function storedSaiaKey(ctx) {
+  try {
+    const conn = await ctx.integration.connection.active("saia-gwdg");
+    const cred = conn && (await ctx.integration.connection.resolve(conn));
+    return cred?.type === "key" ? cred.key : undefined;
+  } catch (e) {
+    pacerDebugLog(`v2: reading the stored saia-gwdg key failed: ${String(e?.message ?? e).slice(0, 160)}`);
+    return undefined;
+  }
 }
 
 // SAIA's /models list: the cache while it is fresh (zero SAIA requests),
@@ -2447,10 +2464,12 @@ export const server = async (input) => {
     },
 
     config: async (config) => {
-      // Optional failover keys come from KEYS_PATH, after the auth.json key.
-      const keys = loadSaiaKeys();
-      if (!keys) return;
-      installPacer(keys);
+      // The stored key is only reachable through setup()'s ctx, which v1
+      // never passes (and v1 cannot load this plugin anyway), so this hook
+      // works with whatever keys the pacer already holds. Only the tests run
+      // it, seeding a key through KEYS_PATH.
+      const keys = globalThis.__saiaKeys;
+      if (!keys?.length) return;
       pacerDebugLog(`pacer: ${keys.length} SAIA key(s) in rotation, timeout=${TIMEOUT_MS}ms`);
 
       const models = await loadSaiaModels(keys[0]);
@@ -2589,6 +2608,7 @@ const V2_EVENT_TYPES = [
   "session.inbox.enqueued",
   "session.deleted",
 ];
+const CREDENTIAL_EVENT_TYPES = ["credential.updated", "credential.switched"];
 
 // v2 errors are {type, message, ...}; classifyResume speaks the v1
 // {name, data:{message, statusCode, isRetryable}} shape.
@@ -2688,9 +2708,11 @@ const v2ClientShim = (ctx) => ({
 });
 
 const setup = async (ctx) => {
-  const keys = loadSaiaKeys();
+  const keys = saiaKeys(await storedSaiaKey(ctx));
   if (!keys) {
-    pacerDebugLog("v2: no saia-gwdg key in auth.json — plugin inactive");
+    // Inactive for this process: a key stored later is picked up only after a
+    // restart (`opencode service stop`), as no event loop runs without one.
+    pacerDebugLog("v2: no saia-gwdg key stored — plugin inactive (store one: opencode auth login saia-gwdg, then: opencode service stop)");
     return;
   }
   installPacer(keys);
@@ -2699,19 +2721,15 @@ const setup = async (ctx) => {
   const ready = publishModels(await loadSaiaModels(keys[0]));
   if (ready.length) {
     await ctx.provider.transform((draft) => {
-      // v2 refuses to call a provider it holds no credential for ("No
-      // authentication provided") and does not read the v1 auth.json. The
-      // pacer rewrites Authorization per request anyway (key rotation), so the
-      // first key here only has to get the request past that gate. A test
-      // baseURL must win too, or fault injection spends real SAIA requests.
-      draft.update("saia-gwdg", (p) => {
-        p.settings = {
-          ...(p.settings ?? {}),
-          apiKey: keys[0],
-          ...(SAIA_BASE_URL !== SAIA_PROD_BASE_URL ? { baseURL: SAIA_BASE_URL } : {}),
-        };
-      });
-      if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
+      // No apiKey here: opencode hands the provider its stored credential
+      // itself. A test baseURL must win, or fault injection spends real SAIA
+      // requests.
+      if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) {
+        draft.update("saia-gwdg", (p) => {
+          p.settings = { ...(p.settings ?? {}), baseURL: SAIA_BASE_URL };
+        });
+        pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
+      }
       for (const m of ready) {
         draft.models.update("saia-gwdg", m.id, (x) => {
           x.name = m.name ?? m.id;
@@ -2742,7 +2760,18 @@ const setup = async (ctx) => {
   const turns = new Map();
   (async () => {
     try {
-      for await (const evt of ctx.event.subscribe({ types: V2_EVENT_TYPES, signal: stop.signal })) {
+      for await (const evt of ctx.event.subscribe({ types: [...V2_EVENT_TYPES, ...CREDENTIAL_EVENT_TYPES], signal: stop.signal })) {
+        // A key stored or switched later (`opencode auth login saia-gwdg`)
+        // must reach the pacer, which rewrites every request's Authorization:
+        // the background service outlives the key that was active at setup().
+        if (CREDENTIAL_EVENT_TYPES.includes(evt.type)) {
+          const next = saiaKeys(await storedSaiaKey(ctx));
+          if (next && next[0] !== globalThis.__saiaKeys?.[0]) {
+            installPacer(next);
+            pacerDebugLog(`pacer: stored saia-gwdg key changed (…${next[0].slice(-4)}) — ${next.length} key(s) in rotation`);
+          }
+          continue;
+        }
         for (const event of translateV2Event(evt, turns)) {
           try {
             await hooks.event({ event });
@@ -2771,12 +2800,11 @@ export default { id: "saia-gwdg", setup };
 // So the fetch patch goes in at module evaluation. It must stay the LAST
 // statement of this module: installPacer reads consts declared throughout the
 // file, which are in the TDZ until their declarations have run. Idempotent
-// (__saiaPacerInstalled), so the v1 config hook and setup() calling it again
-// only refresh the key list.
-{
-  const keys = loadSaiaKeys();
-  if (keys) installPacer(keys);
-}
+// (__saiaPacerInstalled), so setup() calling it again only refreshes the key
+// list — which is where the stored key joins: opencode's credential store is
+// only reachable through setup()'s ctx. Until then the pacer holds just the
+// failover keys; no SAIA request is made before setup() registers the models.
+installPacer(loadExtraKeys());
 __OC_FILE_EOF__
 
 write_file "yagni.md" <<'__OC_FILE_EOF__'
@@ -2993,7 +3021,6 @@ write_file "scripts/reload-models.sh" <<'__OC_FILE_EOF__'
 #
 set -euo pipefail
 
-AUTH_FILE="$HOME/.local/share/opencode/auth.json"
 KEYS_FILE="$HOME/.local/share/opencode/saia-gwdg-keys.json"
 CACHE_FILE="$HOME/.cache/opencode/saia-gwdg-models.json"
 
@@ -3004,10 +3031,16 @@ for c in python3 python "py -3"; do
 done
 [[ -n "$PY" ]] || { echo "ERROR: python3 not found — /reload_models needs it." >&2; exit 1; }
 
-# auth.json key first, then any extra failover keys (same order as the plugin)
-KEYS="$(AUTH_FILE="$AUTH_FILE" KEYS_FILE="$KEYS_FILE" $PY -c "
-import json, os
-keys = [json.load(open(os.environ['AUTH_FILE']))['saia-gwdg']['key']]
+OC="$(command -v opencode || echo "$HOME/.opencode/bin/opencode")"
+
+# opencode's stored saia-gwdg key first (read through opencode itself: its
+# credential store has no stable on-disk format), then any extra failover keys
+# (same order as the plugin)
+KEYS="$("$OC" auth export saia-gwdg --standalone 2>/dev/null | KEYS_FILE="$KEYS_FILE" $PY -c "
+import json, os, sys
+creds = [c for c in json.load(sys.stdin) if c.get('integrationID') == 'saia-gwdg' and c.get('value', {}).get('type') == 'key']
+creds.sort(key=lambda c: not c.get('active'))
+keys = [creds[0]['value']['key']]
 try:
     for k in json.load(open(os.environ['KEYS_FILE'])).get('keys', []):
         if isinstance(k, str) and k and k not in keys:
@@ -3015,7 +3048,7 @@ try:
 except Exception:
     pass
 print('\n'.join(keys))
-" 2>/dev/null)" || { echo "ERROR: could not read saia-gwdg key from $AUTH_FILE" >&2; exit 1; }
+" 2>/dev/null)" || { echo "ERROR: no saia-gwdg key in opencode's credential store — run: opencode auth login saia-gwdg" >&2; exit 1; }
 
 BODY=""
 while IFS= read -r KEY; do
@@ -3586,55 +3619,38 @@ FAILURES: (only if FAIL)
 ```
 __OC_FILE_EOF__
 
-write_file "prompts/vision.md" <<'__OC_FILE_EOF__'
-# Vision Analyst
-
-You analyze images (and other media your model accepts) for an orchestrator.
-You have no edit/bash/write access — your output is findings, nothing else.
-
-## Getting the media
-
-- Images referenced in the task as @/abs/path arrive as attachments in your
-  first message. Analyze them directly.
-- If the task mentions a media file by path but no attachment is present, call
-  the read tool on that path — it returns images as attachments.
-- If a file cannot be read, or no media is present at all, do not guess:
-  return STATUS: NO_IMAGE and list the exact path(s) you tried.
-
-## Rules
-
-- Every response step costs one rate-limited API request — batch independent
-  tool calls (several reads) into a single step instead of one call per step.
-- Report only what is actually visible. Never invent, infer, or "helpfully"
-  complete detail you cannot see. If text in the image is unreadable, say so.
-- For UI screenshots: describe the layout, quote visible text verbatim, and
-  call out errors, warnings and empty states.
-- For charts and diagrams: extract the concrete values, labels and
-  relationships, not a vague summary.
-- For code screenshots: transcribe the code exactly — do not paraphrase it.
-- With several attachments, say which finding belongs to which image.
-
-## Required output
-
-End every response with exactly this block:
-
-```
-## VISION
-STATUS: OK | NO_IMAGE
-MEDIA ANALYZED:
-- <path or "attachment N"> — <one-line subject>
-FINDINGS:
-- <concrete findings per image; verbatim where text is involved>
-```
-__OC_FILE_EOF__
-
+# The key lives in opencode's own credential store — the only place opencode v2
+# reads keys from, and where `opencode auth login saia-gwdg` puts it. That
+# command needs a terminal for the key, so the installer pipes it to
+# `opencode auth import` on stdin instead: never on a command line. Each
+# `--standalone` call starts a private server on the installed config, so this
+# runs after the config files are final.
 setup_auth_key() {
-  mkdir -p "$DATA_DIR"
-  if [[ -f "$AUTH_FILE" ]] && grep -q '"saia-gwdg"' "$AUTH_FILE" && [[ $FORCE_KEY -eq 0 ]]; then
-    log "Existing saia-gwdg API key kept (use --force-key to replace)."
+  if [[ $OPENCODE_MISSING -eq 1 ]]; then
+    log "No API key stored (opencode keeps it in its own credential store)."
+    # --standalone: a plain `auth login` would start the background service
+    # with the plugin loaded before the key exists, i.e. inactive.
+    log "After installing opencode, run: opencode auth login saia-gwdg --standalone"
     return 0
   fi
-  local key="${GWDG_API_KEY:-}"
+  local stored key legacy id old
+  stored="$(opencode auth list --standalone --format json | $PY -c '
+import json, sys
+for i in json.load(sys.stdin):
+    if i.get("id") == "saia-gwdg":
+        print(" ".join(c["id"] for c in i.get("connections", []) if c.get("type") == "credential"))
+')" || die "Could not read opencode's credentials ('opencode auth list --standalone' failed, see above)."
+  if [[ -n "$stored" && $FORCE_KEY -eq 0 ]]; then
+    log "Existing saia-gwdg API key kept (use --force-key to replace)."
+    drop_legacy_key
+    return 0
+  fi
+  key="${GWDG_API_KEY:-}"
+  legacy="$(legacy_key)"
+  if [[ -z "$key" && -n "$legacy" && $FORCE_KEY -eq 0 ]]; then
+    key="$legacy"
+    log "Moving the saia-gwdg API key from $AUTH_FILE into opencode's credential store."
+  fi
   if [[ -z "$key" ]]; then
     if [[ -t 0 ]]; then
       read -r -s -p "Enter your GWDG/SAIA API key (Academic Cloud portal): " key
@@ -3644,30 +3660,60 @@ setup_auth_key() {
     fi
   fi
   if [[ -z "$key" ]]; then die "No API key provided."; fi
-  if [[ -f "$AUTH_FILE" ]]; then
-    backup_existing "auth.json" "$AUTH_FILE"
+  id="cred_saia_$(date +%s)_$$"
+  KEY="$key" ID="$id" $PY -c '
+import json, os
+print(json.dumps([{"id": os.environ["ID"], "integrationID": "saia-gwdg", "label": "SAIA (GWDG)",
+                   "active": True, "value": {"type": "key", "key": os.environ["KEY"]}}]))
+' | opencode auth import --standalone >/dev/null \
+    || die "Could not store the API key ('opencode auth import --standalone' failed, see above)."
+  # --force-key: import never activates over an existing key — switch, then
+  # log the replaced one out, so opencode holds exactly one saia-gwdg key.
+  if [[ -n "$stored" ]]; then
+    opencode auth switch saia-gwdg "$id" --standalone >/dev/null \
+      || die "Could not activate the new API key ('opencode auth switch saia-gwdg $id --standalone' failed, see above)."
+    for old in $stored; do
+      opencode auth logout saia-gwdg "$old" --standalone >/dev/null \
+        || log "WARNING: the replaced key is still stored — run: opencode auth logout saia-gwdg $old"
+    done
   fi
-  # merge into any existing auth.json (it may hold other providers' keys)
-  ( umask 077; KEY="$key" AUTH_FILE="$AUTH_FILE" $PY - <<'PYEOF'
+  log "API key stored in opencode's credential store (see: opencode auth list)."
+  drop_legacy_key
+}
+
+# The saia-gwdg key of an install from before the credential store (auth.json,
+# which opencode v2 never reads). Empty when there is none.
+legacy_key() {
+  [[ -f "$AUTH_FILE" ]] || return 0
+  AUTH_FILE="$AUTH_FILE" $PY -c '
+import json, os
+print(json.load(open(os.environ["AUTH_FILE"])).get("saia-gwdg", {}).get("key", ""))
+' 2>/dev/null || true
+}
+
+# Removes that old copy (backed up first); other providers' entries stay.
+drop_legacy_key() {
+  [[ -f "$AUTH_FILE" ]] && grep -q '"saia-gwdg"' "$AUTH_FILE" || return 0
+  backup_existing "auth.json" "$AUTH_FILE"
+  if ( umask 077; AUTH_FILE="$AUTH_FILE" $PY - <<'PYEOF'
 import json, os
 path = os.environ["AUTH_FILE"]
-try:
-    with open(path) as fh:
-        data = json.load(fh)
-    if not isinstance(data, dict):
-        data = {}
-except Exception:
-    data = {}
-data["saia-gwdg"] = {"type": "api", "key": os.environ["KEY"]}
-tmp = path + ".tmp"
-with open(tmp, "w") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, path)
+data = json.load(open(path))
+data.pop("saia-gwdg", None)
+if data:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+else:
+    os.remove(path)
 PYEOF
-  )
-  chmod 600 "$AUTH_FILE"   # no-op on NTFS: there the user-profile ACL protects it
-  log "API key written to $AUTH_FILE (chmod 600)."
+  ); then
+    log "Removed the old saia-gwdg key from $AUTH_FILE (backup in $BACKUP_DIR)."
+  else
+    log "WARNING: could not remove the old saia-gwdg key from $AUTH_FILE — delete its \"saia-gwdg\" entry by hand."
+  fi
 }
 
 setup_extra_keys() {
@@ -3681,6 +3727,7 @@ setup_extra_keys() {
   if [[ -f "$keys_file" ]]; then
     backup_existing "saia-gwdg-keys.json" "$keys_file"
   fi
+  mkdir -p "$DATA_DIR"
   ( umask 077; EXTRA="$extra" KEYS_FILE="$keys_file" $PY - <<'PYEOF'
 import json, os
 keys = [k.strip() for k in os.environ["EXTRA"].split(",") if k.strip()]
@@ -3864,7 +3911,7 @@ verify() {
   if [[ $OPENCODE_MISSING -eq 1 ]]; then
     log ""
     log "opencode is not installed — skipping verification."
-    log "After installing opencode, verify with: opencode models | grep '^saia-gwdg/'"
+    log "After installing opencode and storing the key, verify with: opencode models | grep '^saia-gwdg/'"
     return 0
   fi
   # opencode v2 runs a shared background service that has the OLD plugin and
@@ -3929,7 +3976,8 @@ verify() {
       echo "Last lines of 'opencode models --standalone':"
       tail -n 15 <<<"${out:-(no output)}" | sed 's/^/  | /'
       echo "Troubleshooting:"
-      echo "  - Invalid or expired API key (the plugin fails silently)."
+      echo "  - Invalid, expired or missing API key (the plugin fails silently) — check"
+      echo "    'opencode auth list'; replace it with: opencode auth login saia-gwdg"
       echo "  - GWDG rate limit exhausted (2 req/10s, 200/hour per key) — wait and retry."
       echo "  - Stale cache: rm ~/.cache/opencode/saia-gwdg-models.json and retry."
     } >&2
@@ -3940,10 +3988,10 @@ verify() {
 if [[ $MINIMAL -eq 0 ]]; then   # --minimal writes no scripts (set -e!)
   chmod 755 "$CONFIG_DIR/scripts/reload-models.sh" "$CONFIG_DIR/scripts/usage.sh" "$CONFIG_DIR/scripts/effort.sh"
 fi
-setup_auth_key
-setup_extra_keys
 filter_opencode_jsonc
 fix_instructions_path
 cleanup_disabled_prompts
 remove_full_only_files
+setup_auth_key
+setup_extra_keys
 verify
