@@ -698,16 +698,30 @@ verify() {
     return 0
   fi
   # opencode v2 runs a shared background service that has the OLD plugin and
-  # config loaded; restart it so it (and `opencode models` below) picks up the
-  # files just written. Interrupts sessions running in that service.
-  if opencode service status >/dev/null 2>&1; then
-    log "Restarting the opencode background service to load the new plugin..."
-    opencode service restart >/dev/null 2>&1 || log "WARNING: 'opencode service restart' failed — restart opencode manually."
+  # config loaded. Stop it: the next `opencode` starts a fresh one on the files
+  # just written. Interrupts sessions running in that service. A wedged service
+  # (seen right after the 2.2.5 upgrade: "Server process N is still running")
+  # refuses to stop — that is a warning, never an install failure.
+  local st pid
+  if st="$(opencode service status 2>/dev/null)" && [[ $st != stopped ]]; then
+    log "Stopping the opencode background service so it reloads the new plugin..."
+    if ! opencode service stop >/dev/null 2>&1; then
+      pid="$(sed -nE 's/.*"pid":([0-9]+).*/\1/p' "${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json" 2>/dev/null || true)"
+      pid="${pid:-<pid from ~/.local/state/opencode/service.json>}"
+      log "WARNING: 'opencode service stop' failed — the background service is stuck."
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        log "         Before starting opencode, run: taskkill /F /PID $pid"
+      else
+        log "         Before starting opencode, run: kill $pid"
+      fi
+    fi
   fi
   log ""
-  log "Verifying (fetches the GWDG model list — 1 request of the shared rate budget)..."
+  # --standalone: check the files just written in a fresh process, independent
+  # of the shared service's health and of whatever it still has loaded.
+  log "Verifying (lists the GWDG models — at most 1 request of the shared rate budget)..."
   local out count
-  if out="$(opencode models 2>&1)" && grep -q '^saia-gwdg/' <<<"$out"; then
+  if out="$(opencode models --standalone 2>&1)" && grep -q '^saia-gwdg/' <<<"$out"; then
     count="$(grep -c '^saia-gwdg/' <<<"$out")"
     log "SUCCESS: $count saia-gwdg models available."
     if [[ -n "$BACKUP_DIR" ]]; then
@@ -741,10 +755,12 @@ verify() {
     log "Force-refresh the weekly model cache with /reload_models."
   else
     {
-      echo "FAILED: no saia-gwdg models listed."
+      echo "FAILED: no saia-gwdg models listed. The config files ARE installed — only this check failed."
+      echo "Last lines of 'opencode models --standalone':"
+      tail -n 15 <<<"${out:-(no output)}" | sed 's/^/  | /'
       echo "Troubleshooting:"
       echo "  - Invalid or expired API key (the plugin fails silently)."
-      echo "  - GWDG rate limit exhausted (30 req/min, 200/hour per key) — wait and retry."
+      echo "  - GWDG rate limit exhausted (2 req/10s, 200/hour per key) — wait and retry."
       echo "  - Stale cache: rm ~/.cache/opencode/saia-gwdg-models.json and retry."
     } >&2
     exit 1

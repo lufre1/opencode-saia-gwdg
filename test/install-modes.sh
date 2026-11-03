@@ -5,6 +5,7 @@
 # Runs setup-saia-opencode.sh under a private, empty HOME with no opencode on
 # PATH and no TTY, so ensure_opencode declines the install and verification is
 # skipped: zero network requests, the real ~/.config is never touched.
+# Section 5 puts a stub opencode in the private HOME to drive verify().
 #
 # Usage: test/install-modes.sh
 set -u
@@ -102,6 +103,42 @@ for f in "${FULL_ONLY[@]}"; do
 done
 check "all full-only files back (missing: ${missing[*]:-none})" '[[ ${#missing[@]} -eq 0 ]]'
 check "config has instructions + agent, no default model" '[[ "$(json_keys "$C/opencode.jsonc")" == "\$schema agent instructions provider" ]]'
+
+echo "=== 5. verification with a stub opencode whose background service is wedged"
+# Stub at $HOME/.opencode/bin (ensure_opencode puts that on PATH): `service
+# stop` fails like the wedged 2.2.5 service did, and plain `opencode models`
+# fails like it did through that service — only `--standalone` lists models.
+stub_home() {
+  local h; h="$(new_home "$1")"
+  mkdir -p "$h/.opencode/bin" "$h/.local/state/opencode"
+  echo '{"pid":4242,"url":"http://127.0.0.1:1"}' >"$h/.local/state/opencode/service.json"
+  cat >"$h/.opencode/bin/opencode" <<'STUB'
+#!/bin/bash
+echo "$*" >>"$HOME/stub-calls.log"
+case "$*" in
+  --version)      echo "opencode v2.2.5" ;;
+  "service status") echo "http://127.0.0.1:1" ;;
+  "service stop") echo "Error: Server process 4242 is still running" >&2; exit 1 ;;
+  "models --standalone")
+    [[ -e "$HOME/models-fail" ]] && { echo "Error: stub models failure" >&2; exit 1; }
+    echo "saia-gwdg/stub-model" ;;
+  *) echo "Error: Background service is unresponsive" >&2; exit 1 ;;
+esac
+STUB
+  chmod 755 "$h/.opencode/bin/opencode"
+  echo "$h"
+}
+H="$(stub_home five)"
+run "$H" --minimal; rc=$?
+check "exit 0 despite the wedged service (rc=$rc)" '[[ $rc -eq 0 ]]'
+check "verified via --standalone" 'grep -q "SUCCESS: 1 saia-gwdg models" "$H/install.log"'
+check "stuck-service warning names the pid" 'grep -q "service is stuck" "$H/install.log" && grep -q "kill 4242" "$H/install.log"'
+check "never calls service restart or plain models" '! grep -qxE "service restart|models" "$H/stub-calls.log"'
+H="$(stub_home six)"; touch "$H/models-fail"
+run "$H" --minimal; rc=$?
+check "failed check exits 1 (rc=$rc)" '[[ $rc -eq 1 ]]'
+check "failure shows opencode's own output" 'grep -q "| Error: stub models failure" "$H/install.log"'
+check "failure says the files are installed" 'grep -q "ARE installed" "$H/install.log" && [[ -f "$H/.config/opencode/plugin/saia-gwdg-plugin.js" ]]'
 
 echo
 echo "install-modes: $pass passed, $fail failed"

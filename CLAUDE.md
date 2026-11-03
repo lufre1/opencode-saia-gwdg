@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with this opencode SAIA 
 
 - **Build command:** `./build-setup.sh` — regenerates `setup-saia-opencode.sh` after config changes
 - **Install:** `bash setup-saia-opencode.sh` (interactive prompts for agent selection) or `--yes`/`--solo`/`--auto` flags; `--minimal` = provider + plugin only (no agents/commands/prompts/yagni). Windows: `setup-saia-opencode.cmd` (same args), which runs the `.sh` under Git Bash
-- **Install-mode test:** `bash test/install-modes.sh` — runs the generated installer under a private empty `HOME` with no opencode on `PATH` (verification skipped, zero network): `--minimal`, full→minimal cleanup, `--minimal --solo` refusal, minimal→full restore
+- **Install-mode test:** `bash test/install-modes.sh` — runs the generated installer under a private empty `HOME` with no opencode on `PATH` (verification skipped, zero network): `--minimal`, full→minimal cleanup, `--minimal --solo` refusal, minimal→full restore, plus `verify()` against a stub `opencode` with a wedged service
 - **Model refresh:** `/reload_models` in opencode or `bash scripts/reload-models.sh`, then restart opencode
 - **Reasoning effort:** `/effort off|low|medium|high|max` in opencode or `bash scripts/effort.sh` (applies to the current session immediately — the pacer re-reads the setting per request)
 - **Request log:** `~/.cache/opencode/saia-gwdg-pacer.log` — always on, one `req`/`resp` (or `fail`) line per SAIA request. `SAIA_PACER_DEBUG=1` additionally captures 5xx response bodies.
@@ -40,7 +40,7 @@ The repo uses opencode's auto-discovered folders (installed 1:1 into `~/.config/
 - Event mapping for auto-resume: `session.retry.scheduled` → retrying, `session.execution.{failed,interrupted,succeeded}` → errored/aborted/completed turn, `session.inbox.enqueued` (type user) → user message, `session.deleted`. v2 has **no TUI toast** in the plugin API: notices are pacer-log lines (`notice (no TUI toast…)`)
 - The subagent tool is `subagent` (was `task`); the legacy `permission.task` keys in `opencode.jsonc` are migrated by opencode to `subagent` permissions automatically
 - The typings under `~/.config/opencode/node_modules/@opencode-ai/plugin` are 1.18.14 and **stale** — the 2.2.5 binary is the source of truth for the ctx API
-- A shared background service (`opencode service status`) holds the loaded plugin; the installer restarts it. For tests always pass `--standalone`, or the env (`SAIA_BASE_URL`, …) never reaches the server process
+- A shared background service (`opencode service status`) holds the loaded plugin; the installer **stops** it (the next `opencode` starts a fresh one) and verifies with `opencode models --standalone`. Never verify through the service again: right after the 2.2.5 upgrade it wedged ("Server process N is still running"), `service restart` and plain `opencode models` both failed, and the installer exited 1 over files it had written correctly. For tests always pass `--standalone`, or the env (`SAIA_BASE_URL`, …) never reaches the server process
 
 ### General
 
