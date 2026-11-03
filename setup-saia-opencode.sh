@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit cdf0629, packed 2026-11-02T19:45:14Z
+# Source: opencode-config commit 11cae03, packed 2026-11-03T09:08:29Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — as auto-discovered
@@ -3586,6 +3586,48 @@ FAILURES: (only if FAIL)
 ```
 __OC_FILE_EOF__
 
+write_file "prompts/vision.md" <<'__OC_FILE_EOF__'
+# Vision Analyst
+
+You analyze images (and other media your model accepts) for an orchestrator.
+You have no edit/bash/write access — your output is findings, nothing else.
+
+## Getting the media
+
+- Images referenced in the task as @/abs/path arrive as attachments in your
+  first message. Analyze them directly.
+- If the task mentions a media file by path but no attachment is present, call
+  the read tool on that path — it returns images as attachments.
+- If a file cannot be read, or no media is present at all, do not guess:
+  return STATUS: NO_IMAGE and list the exact path(s) you tried.
+
+## Rules
+
+- Every response step costs one rate-limited API request — batch independent
+  tool calls (several reads) into a single step instead of one call per step.
+- Report only what is actually visible. Never invent, infer, or "helpfully"
+  complete detail you cannot see. If text in the image is unreadable, say so.
+- For UI screenshots: describe the layout, quote visible text verbatim, and
+  call out errors, warnings and empty states.
+- For charts and diagrams: extract the concrete values, labels and
+  relationships, not a vague summary.
+- For code screenshots: transcribe the code exactly — do not paraphrase it.
+- With several attachments, say which finding belongs to which image.
+
+## Required output
+
+End every response with exactly this block:
+
+```
+## VISION
+STATUS: OK | NO_IMAGE
+MEDIA ANALYZED:
+- <path or "attachment N"> — <one-line subject>
+FINDINGS:
+- <concrete findings per image; verbatim where text is involved>
+```
+__OC_FILE_EOF__
+
 setup_auth_key() {
   mkdir -p "$DATA_DIR"
   if [[ -f "$AUTH_FILE" ]] && grep -q '"saia-gwdg"' "$AUTH_FILE" && [[ $FORCE_KEY -eq 0 ]]; then
@@ -3826,16 +3868,30 @@ verify() {
     return 0
   fi
   # opencode v2 runs a shared background service that has the OLD plugin and
-  # config loaded; restart it so it (and `opencode models` below) picks up the
-  # files just written. Interrupts sessions running in that service.
-  if opencode service status >/dev/null 2>&1; then
-    log "Restarting the opencode background service to load the new plugin..."
-    opencode service restart >/dev/null 2>&1 || log "WARNING: 'opencode service restart' failed — restart opencode manually."
+  # config loaded. Stop it: the next `opencode` starts a fresh one on the files
+  # just written. Interrupts sessions running in that service. A wedged service
+  # (seen right after the 2.2.5 upgrade: "Server process N is still running")
+  # refuses to stop — that is a warning, never an install failure.
+  local st pid
+  if st="$(opencode service status 2>/dev/null)" && [[ $st != stopped ]]; then
+    log "Stopping the opencode background service so it reloads the new plugin..."
+    if ! opencode service stop >/dev/null 2>&1; then
+      pid="$(sed -nE 's/.*"pid":([0-9]+).*/\1/p' "${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json" 2>/dev/null || true)"
+      pid="${pid:-<pid from ~/.local/state/opencode/service.json>}"
+      log "WARNING: 'opencode service stop' failed — the background service is stuck."
+      if [[ $IS_WINDOWS -eq 1 ]]; then
+        log "         Before starting opencode, run: taskkill /F /PID $pid"
+      else
+        log "         Before starting opencode, run: kill $pid"
+      fi
+    fi
   fi
   log ""
-  log "Verifying (fetches the GWDG model list — 1 request of the shared rate budget)..."
+  # --standalone: check the files just written in a fresh process, independent
+  # of the shared service's health and of whatever it still has loaded.
+  log "Verifying (lists the GWDG models — at most 1 request of the shared rate budget)..."
   local out count
-  if out="$(opencode models 2>&1)" && grep -q '^saia-gwdg/' <<<"$out"; then
+  if out="$(opencode models --standalone 2>&1)" && grep -q '^saia-gwdg/' <<<"$out"; then
     count="$(grep -c '^saia-gwdg/' <<<"$out")"
     log "SUCCESS: $count saia-gwdg models available."
     if [[ -n "$BACKUP_DIR" ]]; then
@@ -3869,10 +3925,12 @@ verify() {
     log "Force-refresh the weekly model cache with /reload_models."
   else
     {
-      echo "FAILED: no saia-gwdg models listed."
+      echo "FAILED: no saia-gwdg models listed. The config files ARE installed — only this check failed."
+      echo "Last lines of 'opencode models --standalone':"
+      tail -n 15 <<<"${out:-(no output)}" | sed 's/^/  | /'
       echo "Troubleshooting:"
       echo "  - Invalid or expired API key (the plugin fails silently)."
-      echo "  - GWDG rate limit exhausted (30 req/min, 200/hour per key) — wait and retry."
+      echo "  - GWDG rate limit exhausted (2 req/10s, 200/hour per key) — wait and retry."
       echo "  - Stale cache: rm ~/.cache/opencode/saia-gwdg-models.json and retry."
     } >&2
     exit 1
