@@ -8,7 +8,7 @@
 // step-finish reason=stop). The echo must fire ONLY for an expanded slash
 // command: a USER message whose FIRST line is the sentinel.
 //
-// Cases (one process; the pacer is installed once via the config hook, and
+// Cases (one process; the pacer is installed at module load, and
 // every request is pointed at test/fake-saia.py — zero real SAIA requests):
 //   echo         last msg = user, first line is the sentinel   -> local echo, no upstream
 //   tool-result  last msg = tool result containing the sentinel -> passes through
@@ -16,7 +16,7 @@
 //   user-midtext last msg = user, sentinel NOT on the first line -> passes through
 //
 // Usage: node test/local-echo.mjs
-import { mkdtempSync, writeFileSync, readFileSync, openSync } from "fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, openSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { spawn } from "child_process";
@@ -28,6 +28,18 @@ const BUDGET = join(work, "budget.json");
 const SRVLOG = join(work, "server.log");
 writeFileSync(LOG, "");
 writeFileSync(BUDGET, "{}");
+// Private HOME: the real key lives in opencode's credential store, which only
+// setup()'s ctx can reach, so the v1 config hook driven here gets a fake key
+// through the failover-keys file, plus a models cache (no /models fetch).
+const home = join(work, "home");
+mkdirSync(join(home, ".local/share/opencode"), { recursive: true });
+mkdirSync(join(home, ".cache/opencode"), { recursive: true });
+writeFileSync(join(home, ".local/share/opencode/saia-gwdg-keys.json"), JSON.stringify({ keys: ["test-key"] }));
+writeFileSync(
+  join(home, ".cache/opencode/saia-gwdg-models.json"),
+  JSON.stringify({ fetchedAt: Date.now(), models: [{ id: "qwen3.8-27b", name: "Qwen 3.8 27B", status: "ready", input: ["text"], output: ["text"] }] })
+);
+process.env.HOME = home;
 process.env.SAIA_TEST_HOST = "127.0.0.1";
 process.env.SAIA_BASE_URL = `http://127.0.0.1:${PORT}/v1`;
 process.env.SAIA_PACER_LOG = LOG;

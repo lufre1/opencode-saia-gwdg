@@ -17,8 +17,9 @@ const MODELS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // - spaces request starts >= 5100ms apart so the 2-per-10s limit can't trip
 //   (was 30/min until the 2026-10-27 gateway swap)
 // - supports multiple API keys with hard-floor failover: rate limits are
-//   per key, and opencode only knows the auth.json key, so the pacer
-//   rewrites the Authorization header to the active key on every request.
+//   per key, and opencode only knows the one saia-gwdg key in its credential
+//   store (`opencode auth login saia-gwdg`), so the pacer rewrites the
+//   Authorization header to the active key on every request.
 //   When the active key's hour/day/month bucket is nearly empty (or it
 //   429s despite pacing) the pacer switches to the next usable key; an
 //   exhausted key re-enters rotation after its bucket's reset TTL. Extra
@@ -454,13 +455,13 @@ function installPacer(keys) {
       allDead
         ? `All ${all.length} SAIA key(s) rejected by SAIA (${per.join("; ")}) — the key(s) are ` +
           `revoked or expired. Get a new one from https://saia.gwdg.de/ ` +
-          `and update ${join(homedir(), ".local/share/opencode/auth.json")} (extra keys: ${KEYS_PATH}).`
+          `and store it with \`opencode auth login saia-gwdg\` (extra keys: ${KEYS_PATH}).`
         : `All ${all.length} SAIA key(s) nearly exhausted (${per.join("; ")}) — ` +
           `aborting instead of retry-spinning. Wait for the buckets to reset.`
     );
   };
 
-  // Rate limits are per key, but opencode only knows the auth.json key —
+  // Rate limits are per key, but opencode only knows its one stored key —
   // rewrite the Authorization header to the currently active one.
   // NOTE: when both a Request object and an init are passed, init.headers
   // wins in fetch() — so the rewrite must always land on the init side
@@ -1358,25 +1359,33 @@ function budgetStatusLine() {
 // ---------------------------------------------------------------------------
 // Startup inputs shared by the v1 `config` hook and the v2 `setup`.
 
-// auth.json key first, then the optional failover keys from KEYS_PATH, in
-// rotation order. null when there is no SAIA key at all (plugin stays inert).
-function loadSaiaKeys() {
-  let key;
-  try {
-    const auth = JSON.parse(readFileSync(join(homedir(), ".local/share/opencode/auth.json"), "utf-8"));
-    key = auth["saia-gwdg"]?.key;
-  } catch {
-    return null;
-  }
-  if (!key) return null;
-  let keys = [key];
+// The optional failover keys from KEYS_PATH, in rotation order.
+function loadExtraKeys() {
   try {
     const extra = JSON.parse(readFileSync(KEYS_PATH, "utf-8"));
-    if (Array.isArray(extra?.keys)) {
-      keys = [...new Set([key, ...extra.keys.filter((k) => typeof k === "string" && k)])];
-    }
+    if (Array.isArray(extra?.keys)) return extra.keys.filter((k) => typeof k === "string" && k);
   } catch {}
-  return keys;
+  return [];
+}
+
+// opencode's stored saia-gwdg key first, then the failover keys. null without
+// a stored key (plugin stays inert).
+function saiaKeys(storedKey) {
+  return storedKey ? [...new Set([storedKey, ...loadExtraKeys()])] : null;
+}
+
+// The active saia-gwdg key in opencode's own credential store, where
+// `opencode auth login saia-gwdg` and the installer (`opencode auth import`)
+// put it. Only reachable through the v2 ctx, so never before setup().
+async function storedSaiaKey(ctx) {
+  try {
+    const conn = await ctx.integration.connection.active("saia-gwdg");
+    const cred = conn && (await ctx.integration.connection.resolve(conn));
+    return cred?.type === "key" ? cred.key : undefined;
+  } catch (e) {
+    pacerDebugLog(`v2: reading the stored saia-gwdg key failed: ${String(e?.message ?? e).slice(0, 160)}`);
+    return undefined;
+  }
 }
 
 // SAIA's /models list: the cache while it is fresh (zero SAIA requests),
@@ -1984,10 +1993,12 @@ export const server = async (input) => {
     },
 
     config: async (config) => {
-      // Optional failover keys come from KEYS_PATH, after the auth.json key.
-      const keys = loadSaiaKeys();
-      if (!keys) return;
-      installPacer(keys);
+      // The stored key is only reachable through setup()'s ctx, which v1
+      // never passes (and v1 cannot load this plugin anyway), so this hook
+      // works with whatever keys the pacer already holds. Only the tests run
+      // it, seeding a key through KEYS_PATH.
+      const keys = globalThis.__saiaKeys;
+      if (!keys?.length) return;
       pacerDebugLog(`pacer: ${keys.length} SAIA key(s) in rotation, timeout=${TIMEOUT_MS}ms`);
 
       const models = await loadSaiaModels(keys[0]);
@@ -2126,6 +2137,7 @@ const V2_EVENT_TYPES = [
   "session.inbox.enqueued",
   "session.deleted",
 ];
+const CREDENTIAL_EVENT_TYPES = ["credential.updated", "credential.switched"];
 
 // v2 errors are {type, message, ...}; classifyResume speaks the v1
 // {name, data:{message, statusCode, isRetryable}} shape.
@@ -2225,9 +2237,11 @@ const v2ClientShim = (ctx) => ({
 });
 
 const setup = async (ctx) => {
-  const keys = loadSaiaKeys();
+  const keys = saiaKeys(await storedSaiaKey(ctx));
   if (!keys) {
-    pacerDebugLog("v2: no saia-gwdg key in auth.json — plugin inactive");
+    // Inactive for this process: a key stored later is picked up only after a
+    // restart (`opencode service stop`), as no event loop runs without one.
+    pacerDebugLog("v2: no saia-gwdg key stored — plugin inactive (store one: opencode auth login saia-gwdg, then: opencode service stop)");
     return;
   }
   installPacer(keys);
@@ -2236,19 +2250,15 @@ const setup = async (ctx) => {
   const ready = publishModels(await loadSaiaModels(keys[0]));
   if (ready.length) {
     await ctx.provider.transform((draft) => {
-      // v2 refuses to call a provider it holds no credential for ("No
-      // authentication provided") and does not read the v1 auth.json. The
-      // pacer rewrites Authorization per request anyway (key rotation), so the
-      // first key here only has to get the request past that gate. A test
-      // baseURL must win too, or fault injection spends real SAIA requests.
-      draft.update("saia-gwdg", (p) => {
-        p.settings = {
-          ...(p.settings ?? {}),
-          apiKey: keys[0],
-          ...(SAIA_BASE_URL !== SAIA_PROD_BASE_URL ? { baseURL: SAIA_BASE_URL } : {}),
-        };
-      });
-      if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
+      // No apiKey here: opencode hands the provider its stored credential
+      // itself. A test baseURL must win, or fault injection spends real SAIA
+      // requests.
+      if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) {
+        draft.update("saia-gwdg", (p) => {
+          p.settings = { ...(p.settings ?? {}), baseURL: SAIA_BASE_URL };
+        });
+        pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
+      }
       for (const m of ready) {
         draft.models.update("saia-gwdg", m.id, (x) => {
           x.name = m.name ?? m.id;
@@ -2279,7 +2289,18 @@ const setup = async (ctx) => {
   const turns = new Map();
   (async () => {
     try {
-      for await (const evt of ctx.event.subscribe({ types: V2_EVENT_TYPES, signal: stop.signal })) {
+      for await (const evt of ctx.event.subscribe({ types: [...V2_EVENT_TYPES, ...CREDENTIAL_EVENT_TYPES], signal: stop.signal })) {
+        // A key stored or switched later (`opencode auth login saia-gwdg`)
+        // must reach the pacer, which rewrites every request's Authorization:
+        // the background service outlives the key that was active at setup().
+        if (CREDENTIAL_EVENT_TYPES.includes(evt.type)) {
+          const next = saiaKeys(await storedSaiaKey(ctx));
+          if (next && next[0] !== globalThis.__saiaKeys?.[0]) {
+            installPacer(next);
+            pacerDebugLog(`pacer: stored saia-gwdg key changed (…${next[0].slice(-4)}) — ${next.length} key(s) in rotation`);
+          }
+          continue;
+        }
         for (const event of translateV2Event(evt, turns)) {
           try {
             await hooks.event({ event });
@@ -2308,9 +2329,8 @@ export default { id: "saia-gwdg", setup };
 // So the fetch patch goes in at module evaluation. It must stay the LAST
 // statement of this module: installPacer reads consts declared throughout the
 // file, which are in the TDZ until their declarations have run. Idempotent
-// (__saiaPacerInstalled), so the v1 config hook and setup() calling it again
-// only refresh the key list.
-{
-  const keys = loadSaiaKeys();
-  if (keys) installPacer(keys);
-}
+// (__saiaPacerInstalled), so setup() calling it again only refreshes the key
+// list — which is where the stored key joins: opencode's credential store is
+// only reachable through setup()'s ctx. Until then the pacer holds just the
+// failover keys; no SAIA request is made before setup() registers the models.
+installPacer(loadExtraKeys());

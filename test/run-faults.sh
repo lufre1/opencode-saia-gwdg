@@ -41,8 +41,12 @@ mkdir -p "$FAKE_HOME/.config" "$FAKE_HOME/.local/share/opencode" "$FAKE_HOME/.ca
 cp -r "$REAL_HOME/.config/opencode" "$FAKE_HOME/.config/opencode"
 rm -rf "$FAKE_HOME/.config/opencode/node_modules"
 cp "$REPO/plugin/saia-gwdg-plugin.js" "$FAKE_HOME/.config/opencode/plugin/saia-gwdg-plugin.js"
-printf '{"saia-gwdg":{"type":"api","key":"FAKE-KEY-run-faults"}}\n' > "$FAKE_HOME/.local/share/opencode/auth.json"
 cp "$REAL_HOME/.cache/opencode/saia-gwdg-models.json" "$FAKE_HOME/.cache/opencode/" 2>/dev/null || true
+# The fake key goes into the private HOME's opencode credential store, the
+# way the installer stores the real one.
+printf '[{"id":"cred_run_faults","integrationID":"saia-gwdg","label":"SAIA (GWDG)","active":true,"value":{"type":"key","key":"FAKE-KEY-run-faults"}}]\n' \
+  | HOME="$FAKE_HOME" "$OC" auth import --standalone >/dev/null 2>&1 \
+  || { echo "could not store the fake key in $FAKE_HOME"; exit 1; }
 
 start_server() { # $1 = mode
   FAKE_SAIA_MODE="$1" FAKE_SAIA_PORT="$PORT" python3 "$REPO/test/fake-saia.py" >"$WORK/server-$1.log" 2>&1 &

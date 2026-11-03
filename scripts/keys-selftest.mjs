@@ -19,20 +19,23 @@ import assert from "node:assert/strict";
 // so the test writes its log/budget files into a temp dir, not the real cache.
 process.env.HOME = mkdtempSync(join(tmpdir(), "saia-selftest-"));
 
-const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../plugin/saia-gwdg-plugin.js"), "utf-8")
-  .replace(/from "(fs|os|path|url)"/g, 'from "node:$1"') // data: modules need the node: prefix
-  .replace(/^export\s+/gm, "");
-const { installPacer } = await import(
-  `data:text/javascript,${encodeURIComponent(`${src}\nexport { installPacer };`)}`
-);
-
 const DEAD = "dead-key", GOOD = "good-key";
 const seen = [];
+// Before the import: the plugin wraps fetch at module evaluation, so this fake
+// must already be there to become the pacer's realFetch.
 globalThis.fetch = async (_input, init) => {
   const key = new Headers(init.headers).get("authorization");
   seen.push(key);
   return new Response("{}", { status: key === `Bearer ${DEAD}` ? 401 : 200 });
 };
+
+const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../plugin/saia-gwdg-plugin.js"), "utf-8")
+  .replace(/from "(fs|os|path|url)"/g, 'from "node:$1"') // data: modules need the node: prefix
+  .replace(/^export default .*$/m, "")
+  .replace(/^export\s+/gm, "");
+const { installPacer } = await import(
+  `data:text/javascript,${encodeURIComponent(`${src}\nexport { installPacer };`)}`
+);
 
 installPacer([DEAD, GOOD]);
 

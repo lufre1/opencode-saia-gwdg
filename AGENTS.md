@@ -18,8 +18,8 @@ The repo mirrors the installed `~/.config/opencode` layout using opencode's auto
 | `prompts/` | System prompts for the two optional primaries only (`auto.md`, `solo.md`), via `{file:./prompts/*.md}`; the plugin also reads `../prompts/{auto,solo}.md` for budget injection. Subagent prompts are the bodies of their `agent/*.md` |
 | `tool/`, `skill/` | Scaffolds (with READMEs) for future opencode custom tools / skills |
 | `yagni.md` | Global instruction appended to every agent (via `instructions`) |
-| `auth.json` (in `~/.local/share/opencode/`) | Stores API key (chmod 600) |
-| `saia-gwdg-keys.json` (in `~/.local/share/opencode/`) | Optional extra failover keys `{"keys": [...]}` (chmod 600); auth.json key is always #1 |
+| opencode credential store (`opencode auth list`) | Stores the API key (`opencode auth login saia-gwdg`) |
+| `saia-gwdg-keys.json` (in `~/.local/share/opencode/`) | Optional extra failover keys `{"keys": [...]}` (chmod 600); the stored key is always #1 |
 | `build-setup.sh` | Packs the live config into `setup-saia-opencode.sh` — rerun after config changes |
 | `keyring/` | Key-rotating proxy (`saia_keyring.py`) + installer fragment (`saia-keyring.sh`) for the *other* harness installers; vendored into their `src/` by `keyring/sync.sh`, never packed into the opencode installer |
 | `setup-saia-opencode.sh` | Generated self-contained installer for other devices (never edit directly) |
@@ -59,7 +59,7 @@ When you press `Tab` to select `auto` and give it a task, it runs a 5-phase loop
 
 ## Key Facts
 
-- **API key location**: `~/.local/share/opencode/auth.json` (plaintext, chmod 600); optional extra failover keys in `~/.local/share/opencode/saia-gwdg-keys.json`
+- **API key location**: opencode's own credential store (`opencode auth list`, replace with `opencode auth login saia-gwdg`); optional extra failover keys in `~/.local/share/opencode/saia-gwdg-keys.json`
 - **Model list**: Cached weekly — `~/.cache/opencode/saia-gwdg-models.json` is authoritative while <7 days old (zero-request launches); older/missing cache triggers one `/v1/models` fetch (stale cache as failure fallback). Force a refresh with `/reload_models` (needs bash — solo/build agent) or `./scripts/reload-models.sh`, then restart opencode
 - **Rate limits (per key, all endpoints)**: 2 req/10s, 200/hour, 400/day, 3000/month (30/min and 1000/day until 2026-10-27) — each agent step is one request; the monthly bucket is the binding long-term constraint (sustainable pace ≈100 requests/day per key); a hung run usually means every key's bucket is exhausted
 - **`build` and `plan` have no `steps` cap** (deliberate: a step cap ends a long autonomous task mid-work regardless of remaining budget). Their only brake is the pacer's per-key budget floors — a runaway loop is stopped by budget, not by a counter, so watch `/usage` on long runs. The custom agents keep their caps, raised 2026-09-16 because `coder` was hitting its cap on long tasks: `solo` 60, `auto` 40, `coder`/`coder2` 60, `researcher`/`debugger` 25. A cap is a ceiling, not a target — raising it costs nothing on tasks that finish early
@@ -95,5 +95,5 @@ opencode providers    # show provider status
 - Reordering either primary's `permission.task` so the wildcard comes after the named entries → last-match-wins resolution ignores them. `auto` is allow-by-exception (`"*": "allow"` first, then `general`/`explore` denied); `solo` is deny-by-exception (`"*": "deny"` first, then `debugger` allowed). A wildcard placed last in `auto` re-allows the natives; placed last in `solo` it denies everything and silently removes the `task` tool
 - Renaming the `__SAIA_BUDGET_STATUS__` placeholder in `prompts/auto.md` or `prompts/solo.md` (or moving the files) → the plugin's prompt injection silently stops and the budget check degrades to skipped
 - Making an agent read files outside the project (e.g. `~/.cache`) → `external_directory` permission is auto-rejected in non-interactive runs and kills the run at that step
-- Deleting `auth.json` → plugin silently fails, no models loaded
+- `opencode auth logout saia-gwdg` → plugin silently inactive, no models loaded (pacer log: `no saia-gwdg key stored`)
 - A broken models fetch (offline, exhausted budget) is masked silently: the plugin falls back to the last cached list in `~/.cache/opencode/saia-gwdg-models.json`, however old it is

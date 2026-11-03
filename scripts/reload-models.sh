@@ -9,7 +9,6 @@
 #
 set -euo pipefail
 
-AUTH_FILE="$HOME/.local/share/opencode/auth.json"
 KEYS_FILE="$HOME/.local/share/opencode/saia-gwdg-keys.json"
 CACHE_FILE="$HOME/.cache/opencode/saia-gwdg-models.json"
 
@@ -20,10 +19,16 @@ for c in python3 python "py -3"; do
 done
 [[ -n "$PY" ]] || { echo "ERROR: python3 not found — /reload_models needs it." >&2; exit 1; }
 
-# auth.json key first, then any extra failover keys (same order as the plugin)
-KEYS="$(AUTH_FILE="$AUTH_FILE" KEYS_FILE="$KEYS_FILE" $PY -c "
-import json, os
-keys = [json.load(open(os.environ['AUTH_FILE']))['saia-gwdg']['key']]
+OC="$(command -v opencode || echo "$HOME/.opencode/bin/opencode")"
+
+# opencode's stored saia-gwdg key first (read through opencode itself: its
+# credential store has no stable on-disk format), then any extra failover keys
+# (same order as the plugin)
+KEYS="$("$OC" auth export saia-gwdg --standalone 2>/dev/null | KEYS_FILE="$KEYS_FILE" $PY -c "
+import json, os, sys
+creds = [c for c in json.load(sys.stdin) if c.get('integrationID') == 'saia-gwdg' and c.get('value', {}).get('type') == 'key']
+creds.sort(key=lambda c: not c.get('active'))
+keys = [creds[0]['value']['key']]
 try:
     for k in json.load(open(os.environ['KEYS_FILE'])).get('keys', []):
         if isinstance(k, str) and k and k not in keys:
@@ -31,7 +36,7 @@ try:
 except Exception:
     pass
 print('\n'.join(keys))
-" 2>/dev/null)" || { echo "ERROR: could not read saia-gwdg key from $AUTH_FILE" >&2; exit 1; }
+" 2>/dev/null)" || { echo "ERROR: no saia-gwdg key in opencode's credential store — run: opencode auth login saia-gwdg" >&2; exit 1; }
 
 BODY=""
 while IFS= read -r KEY; do

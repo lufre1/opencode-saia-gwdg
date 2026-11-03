@@ -36,8 +36,9 @@ auto-discovered folders.
 | `setup-saia-opencode.sh` | Generated installer (never edit directly) |
 | `setup-saia-opencode.cmd` | Windows launcher: runs the `.sh` under Git Bash (hand-written, not generated) |
 
-The API key is **not** in the repo — the installer writes it to
-`~/.local/share/opencode/auth.json` (chmod 600).
+The API key is **not** in the repo — the installer stores it in opencode's own
+credential store (`opencode auth list`; replace it with
+`opencode auth login saia-gwdg`).
 
 ## How the folders work
 
@@ -126,7 +127,7 @@ See `SETUP.md` for detailed installation instructions and agent selection.
 ## Architecture
 
 ```
-auth.json → plugin/saia-gwdg-plugin.js → opencode.jsonc → https://chat-ai.academiccloud.de/v1
+opencode credential store → plugin/saia-gwdg-plugin.js → opencode.jsonc → https://chat-ai.academiccloud.de/v1
 ```
 
 ## Maintaining

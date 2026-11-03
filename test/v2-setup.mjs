@@ -12,9 +12,13 @@
 //     fires session.prompt; execution.interrupted is never resumed
 //   - the cleanup function returned by setup runs
 //
-// Fully isolated: HOME points at a temp dir holding a fake auth.json and
-// models cache, so the real ~/.cache/opencode files are never read or written,
-// and every request goes to test/fake-saia.py. Zero real SAIA requests.
+//   - the key comes from opencode's credential store (ctx.integration), is
+//     not injected into the provider, and a key switched later reaches the wire
+//
+// Fully isolated: HOME points at a temp dir holding a fake models cache, the
+// stored key is a fake ctx.integration, so the real ~/.cache/opencode files
+// are never read or written, and every request goes to test/fake-saia.py.
+// Zero real SAIA requests.
 //
 // Usage: node test/v2-setup.mjs
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, openSync } from "fs";
@@ -27,7 +31,6 @@ const work = mkdtempSync(join(tmpdir(), "saia-v2-"));
 const home = join(work, "home");
 mkdirSync(join(home, ".local/share/opencode"), { recursive: true });
 mkdirSync(join(home, ".cache/opencode"), { recursive: true });
-writeFileSync(join(home, ".local/share/opencode/auth.json"), JSON.stringify({ "saia-gwdg": { type: "api", key: "test-key" } }));
 writeFileSync(
   join(home, ".cache/opencode/saia-gwdg-models.json"),
   JSON.stringify({
@@ -59,10 +62,12 @@ await new Promise((r) => setTimeout(r, 700));
 // Records every body the pacer puts on the wire. Installed BEFORE the plugin,
 // so the pacer captures it as its realFetch and sits on top of it.
 const wire = [];
+const wireAuth = [];
 const baseFetch = globalThis.fetch;
 globalThis.fetch = (input, init) => {
   try {
     wire.push(JSON.parse(init?.body));
+    wireAuth.push(new Headers(init?.headers).get("authorization"));
   } catch {}
   return baseFetch(input, init);
 };
@@ -92,8 +97,16 @@ const push = (evt) => {
   queue.push({ id: `evt_${queue.length}_${Date.now()}`, ...evt });
   wake?.();
 };
+// opencode's credential store, as the 2.2.5 binary returns it.
+let storedKey = "test-key";
 const ctx = {
   location: { directory: work },
+  integration: {
+    connection: {
+      active: async (id) => (id === "saia-gwdg" && storedKey ? { type: "credential", id: "cred_test", label: "SAIA (GWDG)", method: "key" } : undefined),
+      resolve: async (c) => (c?.id === "cred_test" ? { type: "key", key: storedKey } : undefined),
+    },
+  },
   provider: {
     transform: async (cb) => {
       cb({
@@ -155,6 +168,16 @@ check("default.id is a string", typeof mod.default?.id === "string", JSON.string
 check("default.setup is a function", typeof mod.default?.setup === "function");
 check("no default.effect (v2 would treat it as an Effect)", !("effect" in (mod.default ?? {})));
 
+console.log("case: no stored key -> inactive");
+{
+  storedKey = undefined;
+  const r = await mod.default.setup(ctx);
+  check("setup returns nothing", r === undefined);
+  check("no model registered", registered.size === 0, [...registered.keys()].join(","));
+  check("inactive logged with the login hint", pacerLines().some((l) => l.includes("no saia-gwdg key stored") && l.includes("opencode auth login saia-gwdg")));
+  storedKey = "test-key";
+}
+
 const cleanup = await mod.default.setup(ctx);
 
 console.log("case: setup registers models and installs the pacer");
@@ -162,7 +185,7 @@ check("ready model registered", registered.has("saia-gwdg/qwen3.8-27b"), [...reg
 check("unready model not registered", !registered.has("saia-gwdg/glm-5.3-flash"));
 check("temperature capability set", registered.get("saia-gwdg/qwen3.8-27b")?.capabilities?.temperature === true);
 check("model display name set", registered.get("saia-gwdg/qwen3.8-27b")?.name === "Qwen 3.8 27B");
-check("provider gets an API key (v2 refuses keyless providers)", providers.get("saia-gwdg")?.settings?.apiKey === "test-key");
+check("no apiKey injected (opencode supplies its stored credential)", !("apiKey" in (providers.get("saia-gwdg")?.settings ?? {})));
 check("test baseURL wins", providers.get("saia-gwdg")?.settings?.baseURL === `http://127.0.0.1:${PORT}/v1`);
 check("pacer installed", pacerLines().some((l) => l.includes("SAIA key(s) in rotation") && l.includes("opencode v2")));
 check("cleanup is a function", typeof cleanup === "function");
@@ -187,6 +210,7 @@ console.log("case: wire templating");
   const sent = wire.at(-1);
   const sys = sent?.messages?.[0]?.content ?? "";
   check("request reached the wire", resp.status === 200 && !!sent, `status=${resp.status}`);
+  check("stored key on the wire", wireAuth.at(-1) === "Bearer test-key", String(wireAuth.at(-1)));
   check("budget placeholder replaced in system", !sys.includes("__SAIA_BUDGET_STATUS__") && sys.includes("UNKNOWN"), sys.slice(0, 120));
   check("coder2 prompt swapped for coder's", sys.includes(coderBody.slice(0, 200)) && !sys.includes(coder2Body.slice(0, 200)));
   check("user message untouched", sent?.messages?.[1]?.content === "keep __SAIA_BUDGET_STATUS__ verbatim here");
@@ -251,6 +275,21 @@ console.log("case: execution.interrupted is not resumed");
   push({ type: "session.execution.interrupted", data: { sessionID: "ses_b" } });
   await sleep(300);
   check("skip logged as user abort", pacerLines().some((l) => /auto-resume skip session=ses_b reason=aborted/.test(l)), pacerLines().slice(-3).join(" | "));
+}
+
+console.log("case: key switched in opencode reaches the pacer");
+{
+  storedKey = "rotated-key";
+  push({ type: "credential.switched", data: { integrationID: "saia-gwdg", credentialID: "cred_test" } });
+  await sleep(200);
+  const resp = await fetch(`http://127.0.0.1:${PORT}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "qwen3.8-27b", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  });
+  await resp.text();
+  check("change logged", pacerLines().some((l) => l.includes("stored saia-gwdg key changed (…-key)")), pacerLines().slice(-2).join(" | "));
+  check("new key on the wire", wireAuth.at(-1) === "Bearer rotated-key", String(wireAuth.at(-1)));
 }
 
 console.log("case: cleanup");

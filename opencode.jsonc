@@ -8,6 +8,10 @@
   // Commands live in command/*.md (/usage, /reload_models).
   "provider": {
     "saia-gwdg": {
+      // The section header in the /models picker and the integration's name in
+      // `opencode auth` (opencode copies it to both). The key itself lives in
+      // opencode's credential store: `opencode auth login saia-gwdg`.
+      "name": "SAIA (GWDG)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "https://chat-ai.academiccloud.de/v1",

@@ -148,7 +148,7 @@ export PYTHONUTF8=1
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 DATA_DIR="$HOME/.local/share/opencode"   # the plugin hardcodes this path
-AUTH_FILE="$DATA_DIR/auth.json"
+AUTH_FILE="$DATA_DIR/auth.json"          # only to move an old key out of it
 BACKUP_DIR=""
 ASSUME_YES=0
 FORCE_KEY=0
@@ -170,7 +170,9 @@ Usage: [GWDG_API_KEY=... GWDG_API_KEYS_EXTRA=key2,key3] bash setup-saia-opencode
 Installs the GWDG SAIA setup for opencode:
   - opencode.jsonc, plugin/, command/, scripts/, agent/*.md, prompts/*.md
     into ~/.config/opencode
-  - API key into ~/.local/share/opencode/auth.json (chmod 600)
+  - API key into opencode's own credential store (opencode auth list) — a
+    key left in ~/.local/share/opencode/auth.json by an older install is
+    moved there and removed from auth.json
   - optional extra failover keys (GWDG_API_KEYS_EXTRA, comma-separated) into
     ~/.local/share/opencode/saia-gwdg-keys.json (chmod 600) — the plugin
     switches to the next key when the active one's rate budget is exhausted
@@ -203,7 +205,9 @@ Options:
 
 The API key is taken from the GWDG_API_KEY environment variable if set,
 otherwise prompted for interactively. Files that would be overwritten are
-backed up to ~/.config/opencode.bak-<timestamp>/ first.
+backed up to ~/.config/opencode.bak-<timestamp>/ first. Without opencode
+installed no key is stored; run 'opencode auth login saia-gwdg --standalone'
+later.
 USAGE
 }
 
@@ -458,13 +462,38 @@ shopt -u nullglob globstar
 # ── Footer: API key + verification ───────────────────────────────────
 cat >>"$TMP_OUT" <<'OC_GEN_FOOTER'
 
+# The key lives in opencode's own credential store — the only place opencode v2
+# reads keys from, and where `opencode auth login saia-gwdg` puts it. That
+# command needs a terminal for the key, so the installer pipes it to
+# `opencode auth import` on stdin instead: never on a command line. Each
+# `--standalone` call starts a private server on the installed config, so this
+# runs after the config files are final.
 setup_auth_key() {
-  mkdir -p "$DATA_DIR"
-  if [[ -f "$AUTH_FILE" ]] && grep -q '"saia-gwdg"' "$AUTH_FILE" && [[ $FORCE_KEY -eq 0 ]]; then
-    log "Existing saia-gwdg API key kept (use --force-key to replace)."
+  if [[ $OPENCODE_MISSING -eq 1 ]]; then
+    log "No API key stored (opencode keeps it in its own credential store)."
+    # --standalone: a plain `auth login` would start the background service
+    # with the plugin loaded before the key exists, i.e. inactive.
+    log "After installing opencode, run: opencode auth login saia-gwdg --standalone"
     return 0
   fi
-  local key="${GWDG_API_KEY:-}"
+  local stored key legacy id old
+  stored="$(opencode auth list --standalone --format json | $PY -c '
+import json, sys
+for i in json.load(sys.stdin):
+    if i.get("id") == "saia-gwdg":
+        print(" ".join(c["id"] for c in i.get("connections", []) if c.get("type") == "credential"))
+')" || die "Could not read opencode's credentials ('opencode auth list --standalone' failed, see above)."
+  if [[ -n "$stored" && $FORCE_KEY -eq 0 ]]; then
+    log "Existing saia-gwdg API key kept (use --force-key to replace)."
+    drop_legacy_key
+    return 0
+  fi
+  key="${GWDG_API_KEY:-}"
+  legacy="$(legacy_key)"
+  if [[ -z "$key" && -n "$legacy" && $FORCE_KEY -eq 0 ]]; then
+    key="$legacy"
+    log "Moving the saia-gwdg API key from $AUTH_FILE into opencode's credential store."
+  fi
   if [[ -z "$key" ]]; then
     if [[ -t 0 ]]; then
       read -r -s -p "Enter your GWDG/SAIA API key (Academic Cloud portal): " key
@@ -474,30 +503,60 @@ setup_auth_key() {
     fi
   fi
   if [[ -z "$key" ]]; then die "No API key provided."; fi
-  if [[ -f "$AUTH_FILE" ]]; then
-    backup_existing "auth.json" "$AUTH_FILE"
+  id="cred_saia_$(date +%s)_$$"
+  KEY="$key" ID="$id" $PY -c '
+import json, os
+print(json.dumps([{"id": os.environ["ID"], "integrationID": "saia-gwdg", "label": "SAIA (GWDG)",
+                   "active": True, "value": {"type": "key", "key": os.environ["KEY"]}}]))
+' | opencode auth import --standalone >/dev/null \
+    || die "Could not store the API key ('opencode auth import --standalone' failed, see above)."
+  # --force-key: import never activates over an existing key — switch, then
+  # log the replaced one out, so opencode holds exactly one saia-gwdg key.
+  if [[ -n "$stored" ]]; then
+    opencode auth switch saia-gwdg "$id" --standalone >/dev/null \
+      || die "Could not activate the new API key ('opencode auth switch saia-gwdg $id --standalone' failed, see above)."
+    for old in $stored; do
+      opencode auth logout saia-gwdg "$old" --standalone >/dev/null \
+        || log "WARNING: the replaced key is still stored — run: opencode auth logout saia-gwdg $old"
+    done
   fi
-  # merge into any existing auth.json (it may hold other providers' keys)
-  ( umask 077; KEY="$key" AUTH_FILE="$AUTH_FILE" $PY - <<'PYEOF'
+  log "API key stored in opencode's credential store (see: opencode auth list)."
+  drop_legacy_key
+}
+
+# The saia-gwdg key of an install from before the credential store (auth.json,
+# which opencode v2 never reads). Empty when there is none.
+legacy_key() {
+  [[ -f "$AUTH_FILE" ]] || return 0
+  AUTH_FILE="$AUTH_FILE" $PY -c '
+import json, os
+print(json.load(open(os.environ["AUTH_FILE"])).get("saia-gwdg", {}).get("key", ""))
+' 2>/dev/null || true
+}
+
+# Removes that old copy (backed up first); other providers' entries stay.
+drop_legacy_key() {
+  [[ -f "$AUTH_FILE" ]] && grep -q '"saia-gwdg"' "$AUTH_FILE" || return 0
+  backup_existing "auth.json" "$AUTH_FILE"
+  if ( umask 077; AUTH_FILE="$AUTH_FILE" $PY - <<'PYEOF'
 import json, os
 path = os.environ["AUTH_FILE"]
-try:
-    with open(path) as fh:
-        data = json.load(fh)
-    if not isinstance(data, dict):
-        data = {}
-except Exception:
-    data = {}
-data["saia-gwdg"] = {"type": "api", "key": os.environ["KEY"]}
-tmp = path + ".tmp"
-with open(tmp, "w") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, path)
+data = json.load(open(path))
+data.pop("saia-gwdg", None)
+if data:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+else:
+    os.remove(path)
 PYEOF
-  )
-  chmod 600 "$AUTH_FILE"   # no-op on NTFS: there the user-profile ACL protects it
-  log "API key written to $AUTH_FILE (chmod 600)."
+  ); then
+    log "Removed the old saia-gwdg key from $AUTH_FILE (backup in $BACKUP_DIR)."
+  else
+    log "WARNING: could not remove the old saia-gwdg key from $AUTH_FILE — delete its \"saia-gwdg\" entry by hand."
+  fi
 }
 
 setup_extra_keys() {
@@ -511,6 +570,7 @@ setup_extra_keys() {
   if [[ -f "$keys_file" ]]; then
     backup_existing "saia-gwdg-keys.json" "$keys_file"
   fi
+  mkdir -p "$DATA_DIR"
   ( umask 077; EXTRA="$extra" KEYS_FILE="$keys_file" $PY - <<'PYEOF'
 import json, os
 keys = [k.strip() for k in os.environ["EXTRA"].split(",") if k.strip()]
@@ -694,7 +754,7 @@ verify() {
   if [[ $OPENCODE_MISSING -eq 1 ]]; then
     log ""
     log "opencode is not installed — skipping verification."
-    log "After installing opencode, verify with: opencode models | grep '^saia-gwdg/'"
+    log "After installing opencode and storing the key, verify with: opencode models | grep '^saia-gwdg/'"
     return 0
   fi
   # opencode v2 runs a shared background service that has the OLD plugin and
@@ -759,7 +819,8 @@ verify() {
       echo "Last lines of 'opencode models --standalone':"
       tail -n 15 <<<"${out:-(no output)}" | sed 's/^/  | /'
       echo "Troubleshooting:"
-      echo "  - Invalid or expired API key (the plugin fails silently)."
+      echo "  - Invalid, expired or missing API key (the plugin fails silently) — check"
+      echo "    'opencode auth list'; replace it with: opencode auth login saia-gwdg"
       echo "  - GWDG rate limit exhausted (2 req/10s, 200/hour per key) — wait and retry."
       echo "  - Stale cache: rm ~/.cache/opencode/saia-gwdg-models.json and retry."
     } >&2
@@ -770,12 +831,12 @@ verify() {
 if [[ $MINIMAL -eq 0 ]]; then   # --minimal writes no scripts (set -e!)
   chmod 755 "$CONFIG_DIR/scripts/reload-models.sh" "$CONFIG_DIR/scripts/usage.sh" "$CONFIG_DIR/scripts/effort.sh"
 fi
-setup_auth_key
-setup_extra_keys
 filter_opencode_jsonc
 fix_instructions_path
 cleanup_disabled_prompts
 remove_full_only_files
+setup_auth_key
+setup_extra_keys
 verify
 OC_GEN_FOOTER
 

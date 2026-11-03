@@ -14,7 +14,7 @@ What it does:
 
 1. Checks for `opencode` (also looks in `~/.opencode/bin`); if missing, offers to run the official installer (`curl -fsSL https://opencode.ai/install | bash`).
 2. Writes `opencode.jsonc`, `plugin/saia-gwdg-plugin.js`, `command/*.md`, `scripts/*.sh`, `yagni.md`, all `agent/*.md`, and the selected primaries' `prompts/*.md` into `~/.config/opencode/` (using those auto-discovered folders; with `--minimal`, only the first two — see [Minimal install](#minimal-install---minimal)). Files that would be overwritten are backed up to `~/.config/opencode.bak-<timestamp>/` first; unchanged files are left alone (rerunning is safe).
-3. Writes the API key to `~/.local/share/opencode/auth.json` (chmod 600) as `{"saia-gwdg": {"type": "api", "key": "..."}}`, merging into an existing auth.json rather than clobbering other providers. An existing saia-gwdg key is kept unless `--force-key` is passed.
+3. Stores the API key in opencode's own credential store — the same place `opencode auth login saia-gwdg` puts it (check with `opencode auth list`). It is piped to `opencode auth import` on stdin, never put on a command line. An existing saia-gwdg key is kept unless `--force-key` is passed; a key left in `~/.local/share/opencode/auth.json` by an older install is moved over and removed from that file (backed up first; other providers' entries stay). Without opencode installed no key is stored — run `opencode auth login saia-gwdg --standalone` afterwards (`--standalone`, so the background service is not started before the key exists).
 4. Stops opencode's background service (so the next `opencode` loads the new plugin; a stuck service only produces a warning with the pid to kill), then verifies by running `opencode models --standalone` and checking that `saia-gwdg/` models are listed (at most 1 request of the shared GWDG rate budget: 2/10s, 200/hour per key). If the check fails, the files are still installed and opencode's own error is printed.
 
 ## Windows
@@ -50,7 +50,7 @@ type plain `bash setup-saia-opencode.sh` in cmd/PowerShell: that is usually WSL'
   `%USERPROFILE%\.opencode\bin` to your user PATH to run opencode outside Git Bash.
 - Git installed outside `Program Files` (e.g. scoop)? Set `OPENCODE_GIT_BASH_PATH` to
   its `bin\bash.exe` — the launcher and opencode both read it.
-- `chmod 600` is a no-op on NTFS; `auth.json` is protected by your user-profile ACL.
+- `chmod 600` is a no-op on NTFS; `saia-gwdg-keys.json` and opencode's credential store are protected by your user-profile ACL.
 - WSL: run the `.sh` inside WSL exactly as on Linux — that configures the WSL opencode.
 
 ### Agent selection
@@ -107,7 +107,7 @@ The generator refuses to run if a packed file contains the heredoc delimiter or 
 ## Architecture on the target device
 
 ```
-auth.json (API key, chmod 600, ~/.local/share/opencode/)
+opencode credential store (API key: opencode auth login saia-gwdg)
     │
     ▼
 plugin/saia-gwdg-plugin.js (auto-discovered; reads key, fetches models — cached ~7 days — assigns agent models)

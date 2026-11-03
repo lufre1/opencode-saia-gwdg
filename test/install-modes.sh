@@ -36,8 +36,8 @@ done
 [[ ${#FULL_ONLY[@]} -gt 5 ]] || { echo "could not parse the installer's file list" >&2; exit 1; }
 
 run() {  # $1 = HOME, rest = installer args; output to $1/install.log
-  local home="$1"; shift
-  env -i HOME="$home" PATH="$CLEAN_PATH" GWDG_API_KEY=FAKE-KEY-install-modes \
+  local home="$1"; shift   # RUN_KEY="" = no GWDG_API_KEY
+  env -i HOME="$home" PATH="$CLEAN_PATH" GWDG_API_KEY="${RUN_KEY-FAKE-KEY-install-modes}" \
     bash "$INSTALLER" "$@" </dev/null >"$home/install.log" 2>&1
 }
 
@@ -61,7 +61,7 @@ check "only opencode.jsonc + plugin installed" 'minimal_layout "$C"'
 check "config keys are \$schema model provider" '[[ "$(json_keys "$C/opencode.jsonc")" == "\$schema model provider" ]]'
 check "default model is a saia-gwdg model" 'python3 -c "import json,sys; m=json.load(open(sys.argv[1]))[\"model\"]; sys.exit(0 if m.startswith(\"saia-gwdg/\") and len(m) > 10 else 1)" "$C/opencode.jsonc"'
 check "provider keeps chunkTimeout > 90000" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"provider\"][\"saia-gwdg\"][\"options\"][\"chunkTimeout\"] > 90000 else 1)" "$C/opencode.jsonc"'
-check "auth.json written, mode 600" '[[ "$(stat -c %a "$H/.local/share/opencode/auth.json")" == 600 ]] && grep -q "\"saia-gwdg\"" "$H/.local/share/opencode/auth.json"'
+check "no opencode: no key written anywhere, login hint shown" '[[ ! -e "$H/.local/share/opencode/auth.json" ]] && grep -q "run: opencode auth login saia-gwdg" "$H/install.log"'
 check "no backup dir on a fresh install" '! compgen -G "$H/.config/opencode.bak-*" >/dev/null'
 
 echo "=== 2. full (--solo --no-auto), then --minimal over it"
@@ -122,6 +122,9 @@ case "$*" in
   "models --standalone")
     [[ -e "$HOME/models-fail" ]] && { echo "Error: stub models failure" >&2; exit 1; }
     echo "saia-gwdg/stub-model" ;;
+  "auth list --standalone --format json") cat "$HOME/stub-list.json" 2>/dev/null || echo "[]" ;;
+  "auth import --standalone") cat >"$HOME/stub-import.json"; echo "Imported 1 credential" >&2 ;;
+  "auth switch saia-gwdg "*" --standalone" | "auth logout saia-gwdg "*" --standalone") echo "Done" ;;
   *) echo "Error: Background service is unresponsive" >&2; exit 1 ;;
 esac
 STUB
@@ -134,11 +137,35 @@ check "exit 0 despite the wedged service (rc=$rc)" '[[ $rc -eq 0 ]]'
 check "verified via --standalone" 'grep -q "SUCCESS: 1 saia-gwdg models" "$H/install.log"'
 check "stuck-service warning names the pid" 'grep -q "service is stuck" "$H/install.log" && grep -q "kill 4242" "$H/install.log"'
 check "never calls service restart or plain models" '! grep -qxE "service restart|models" "$H/stub-calls.log"'
+check "key stored via opencode auth import (stdin)" 'python3 -c "import json,sys; c=json.load(open(sys.argv[1]))[0]; sys.exit(0 if (c[\"integrationID\"], c[\"value\"], c[\"active\"]) == (\"saia-gwdg\", {\"type\": \"key\", \"key\": \"FAKE-KEY-install-modes\"}, True) else 1)" "$H/stub-import.json"'
+check "key never on a command line" '! grep -q "FAKE-KEY" "$H/stub-calls.log"'
+check "no auth.json written" '[[ ! -e "$H/.local/share/opencode/auth.json" ]]'
 H="$(stub_home six)"; touch "$H/models-fail"
 run "$H" --minimal; rc=$?
 check "failed check exits 1 (rc=$rc)" '[[ $rc -eq 1 ]]'
 check "failure shows opencode's own output" 'grep -q "| Error: stub models failure" "$H/install.log"'
 check "failure says the files are installed" 'grep -q "ARE installed" "$H/install.log" && [[ -f "$H/.config/opencode/plugin/saia-gwdg-plugin.js" ]]'
+
+echo "=== 6. a key in the old auth.json moves into opencode's credential store"
+H="$(stub_home seven)"; A="$H/.local/share/opencode/auth.json"
+mkdir -p "$(dirname "$A")"
+echo '{"saia-gwdg":{"type":"api","key":"LEGACY-KEY"},"other":{"type":"api","key":"x"}}' >"$A"
+RUN_KEY="" run "$H" --minimal; rc=$?
+check "exit 0 (rc=$rc)" '[[ $rc -eq 0 ]]'
+check "legacy key imported" 'grep -q "\"key\": \"LEGACY-KEY\"" "$H/stub-import.json"'
+check "saia-gwdg entry removed, other provider kept" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if list(d) == [\"other\"] else 1)" "$A"'
+check "old auth.json is in the backup" 'grep -q LEGACY-KEY "$(ls -d "$H"/.config/opencode.bak-* | tail -1)/auth.json"'
+
+echo "=== 7. a stored key is kept; --force-key replaces it"
+H="$(stub_home eight)"
+echo '[{"id":"saia-gwdg","name":"SAIA (GWDG)","connections":[{"type":"credential","id":"cred_old","label":"SAIA (GWDG)","method":"key"}]}]' >"$H/stub-list.json"
+run "$H" --minimal; rc=$?
+check "exit 0 (rc=$rc)" '[[ $rc -eq 0 ]]'
+check "kept, nothing imported" 'grep -q "Existing saia-gwdg API key kept" "$H/install.log" && [[ ! -e "$H/stub-import.json" ]]'
+run "$H" --minimal --force-key; rc=$?
+check "--force-key exit 0 (rc=$rc)" '[[ $rc -eq 0 ]]'
+NEW="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[0][\"id\"])" "$H/stub-import.json" 2>/dev/null)"
+check "new key imported, switched to, old one logged out" '[[ -n "$NEW" ]] && grep -qx "auth switch saia-gwdg $NEW --standalone" "$H/stub-calls.log" && grep -qx "auth logout saia-gwdg cred_old --standalone" "$H/stub-calls.log"'
 
 echo
 echo "install-modes: $pass passed, $fail failed"
