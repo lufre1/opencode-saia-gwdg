@@ -40,14 +40,17 @@ writeFileSync(
   JSON.stringify({ fetchedAt: Date.now(), models: [{ id: "qwen3.8-27b", name: "Qwen 3.8 27B", status: "ready", input: ["text"], output: ["text"] }] })
 );
 process.env.HOME = home;
+process.env.USERPROFILE = home;
 process.env.SAIA_TEST_HOST = "127.0.0.1";
 process.env.SAIA_BASE_URL = `http://127.0.0.1:${PORT}/v1`;
 process.env.SAIA_PACER_LOG = LOG;
 process.env.SAIA_BUDGET_PATH = BUDGET;
 
 const srvLogFd = openSync(SRVLOG, "w");
+// Windows has no python3 alias; python is the interpreter there.
+const PY = process.platform === "win32" ? "python" : "python3";
 const srv = spawn(
-  "python3",
+  PY,
   [join(import.meta.dirname, "fake-saia.py")],
   {
     env: { ...process.env, FAKE_SAIA_MODE: "ok", FAKE_SAIA_PORT: String(PORT) },

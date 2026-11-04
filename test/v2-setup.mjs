@@ -46,14 +46,18 @@ writeFileSync(
 const LOG = join(work, "pacer.log");
 const SRVLOG = join(work, "server.log");
 writeFileSync(LOG, "");
+// os.homedir() reads HOME on Linux, USERPROFILE on Windows.
 process.env.HOME = home;
+process.env.USERPROFILE = home;
 process.env.SAIA_TEST_HOST = "127.0.0.1";
 process.env.SAIA_BASE_URL = `http://127.0.0.1:${PORT}/v1`;
 process.env.SAIA_PACER_LOG = LOG;
 process.env.SAIA_BUDGET_PATH = join(work, "budget.json");
 writeFileSync(process.env.SAIA_BUDGET_PATH, "{}");
 
-const srv = spawn("python3", [join(import.meta.dirname, "fake-saia.py")], {
+// Windows has no python3 alias; python is the interpreter there.
+const PY = process.platform === "win32" ? "python" : "python3";
+const srv = spawn(PY, [join(import.meta.dirname, "fake-saia.py")], {
   env: { ...process.env, FAKE_SAIA_MODE: "ok", FAKE_SAIA_PORT: String(PORT) },
   stdio: ["ignore", "ignore", openSync(SRVLOG, "w")],
 });
@@ -192,8 +196,15 @@ check("cleanup is a function", typeof cleanup === "function");
 
 console.log("case: wire templating");
 {
-  const coderBody = readFileSync(join(import.meta.dirname, "../agent/coder.md"), "utf-8").split(/\n---\n/).slice(1).join("\n---\n").trim();
-  const coder2Body = readFileSync(join(import.meta.dirname, "../agent/coder2.md"), "utf-8").split(/\n---\n/).slice(1).join("\n---\n").trim();
+  // Same frontmatter strip as the plugin's agentBody(): a CRLF checkout of
+  // agent/*.md (.gitattributes only pins LF for sh/js/jsonc) must parse too.
+  const agentBody = (name) => {
+    const txt = readFileSync(join(import.meta.dirname, "..", "agent", `${name}.md`), "utf-8");
+    const m = txt.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?([\s\S]*)$/);
+    return (m ? m[1] : txt).trim();
+  };
+  const coderBody = agentBody("coder");
+  const coder2Body = agentBody("coder2");
   const resp = await fetch(`http://127.0.0.1:${PORT}/v1/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
