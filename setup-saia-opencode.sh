@@ -2,7 +2,7 @@
 #
 # setup-saia-opencode.sh — GENERATED FILE, DO NOT EDIT.
 # Regenerate with: ./build-setup.sh  (in the opencode config repo)
-# Source: opencode-config commit f2c41c5, packed 2026-11-04T06:55:17Z
+# Source: opencode-config commit 0818408, packed 2026-11-04T07:57:18Z
 #
 # Installs the GWDG SAIA setup for opencode: provider + plugin, the four
 # subagents (coder, coder2, researcher, debugger — as auto-discovered
@@ -1263,10 +1263,13 @@ function installPacer(keys) {
     );
   };
 
-  // Inject chat_template_kwargs into the JSON body of a chat-completions
-  // request for reasoning-capable models. Returns a new init with the rewritten
-  // body, or the original init when nothing applies. `reasoningModels` is the
-  // set of model ids whose output advertises `thought`.
+  // Inject the reasoning-effort setting into the JSON body of a
+  // chat-completions request for reasoning-capable models: as
+  // chat_template_kwargs normally, or as a top-level reasoning_effort field
+  // for the models in TOP_LEVEL_EFFORT_MODELS (declared further down, near
+  // EFFORT_ALIAS). Returns a new init with the rewritten body, or the original
+  // init when nothing applies. `reasoningModels` is the set of model ids whose
+  // output advertises `thought`.
   const withEffort = (input, init, url, reasoningModels) => {
     if (!url.pathname.endsWith("/chat/completions")) return init;
     let body = init?.body;
@@ -1282,6 +1285,23 @@ function installPacer(keys) {
     if (!reasoningModels.has(baseId)) return init;
     const level = readEffort();
     const mapped = EFFORT_ALIAS[baseId]?.[level] ?? level;
+    // Mistral-tokenizer models reject chat_template_kwargs outright (400
+    // "chat_template is not supported for Mistral tokenizers", verified
+    // 2026-11-04) but accept the effort as a TOP-LEVEL reasoning_effort field
+    // (ladder low/medium/high, verified the same day). `off` is not
+    // expressible top-level: leave the request untouched and let the model
+    // think at its default.
+    if (TOP_LEVEL_EFFORT_MODELS.has(baseId)) {
+      if (level === "off") {
+        pacerDebugLog(`effort=off not expressible top-level for ${parsed.model} — default thinking`);
+        return init;
+      }
+      parsed.reasoning_effort = mapped;
+      pacerDebugLog(
+        `effort=${level}${mapped !== level ? `->${mapped}` : ""} set top-level for ${parsed.model}`
+      );
+      return { ...init, body: JSON.stringify(parsed) };
+    }
     parsed.chat_template_kwargs = effortKwargs(mapped);
     pacerDebugLog(
       `effort=${level}${mapped !== level ? `->${mapped}` : ""} injected for ${parsed.model}`
@@ -1903,7 +1923,20 @@ const FORCE_REASONING = new Set([
 // its own top rung. `off` is never remapped — every model accepts it.
 const EFFORT_ALIAS = {
   "qwen3.8-27b": { high: "xhigh", max: "xhigh" },
+  // Ladder is low/medium/high: probed 2026-11-04, max -> 400 "reasoning_effort
+  // should be one of ['low', 'medium', 'high'], got max."
+  "mistral-large-4-1t-a52b": { max: "high" },
 };
+
+// Models whose serving stack rejects chat_template_kwargs categorically:
+// SAIA answers 400 "chat_template is not supported for Mistral tokenizers.
+// (parameter=chat_template)" — verified on-wire 2026-11-04 (request without
+// kwargs -> 200, with kwargs -> 400, same key, minutes apart). These models
+// receive the /effort level as a TOP-LEVEL reasoning_effort field instead
+// (same day: 200, reasoning_tokens in the usage, level honored). /effort off
+// is not expressible top-level, so it leaves the model at its default
+// thinking.
+const TOP_LEVEL_EFFORT_MODELS = new Set(["mistral-large-4-1t-a52b"]);
 
 // Preferred model per agent role, best first. The plugin picks the first entry
 // that SAIA currently reports as `ready`; if none are ready it falls back to any
@@ -1921,7 +1954,7 @@ const ROLE_MODELS = {
   // Solo workhorse: a thinking model for the one full-context session that
   // plans, implements and self-checks. glm-5.3-flash's 2026-09-09
   // headers-timeout incident is what the model-health breaker below is for.
-  solo:       ["glm-5.3-flash", "deepseek-v4-flash-0731"],
+  solo:       ["glm-5.3-flash", "deepseek-v4-flash-0731", "mistral-large-4-1t-a52b"],
   // Orchestrator: best rule-following per request; deepseek-v4-flash demoted
   // (ignores prompt rules under task pressure — verified 2026-07-13).
   auto:       ["qwen3.8-27b", "deepseek-v4-flash-0731"],
@@ -1933,9 +1966,12 @@ const ROLE_MODELS = {
   plan:       ["deepseek-v4-flash-0731", "qwen3.8-27b", "glm-5.3-flash"],
   build:      ["qwen3.8-27b", "qwen3-coder-next"],
   // Fix rounds run on a DIFFERENT model family to break correlated errors
-  // (glm vs the qwen primary on coder).
-  coder2:     ["glm-5.3-flash", "qwen3-coder-next"],
-  debugger:   ["qwen3-coder-next", "openai-gpt-oss-120b"],
+  // (glm vs the qwen primary on coder). Mistral is a third family, added
+  // 2026-11-04 as the middle fallback.
+  coder2:     ["glm-5.3-flash", "mistral-large-4-1t-a52b", "qwen3-coder-next"],
+  // openai-gpt-oss-120b is no longer on SAIA's list, so mistral (added
+  // 2026-11-04) is the live second fallback here.
+  debugger:   ["qwen3-coder-next", "mistral-large-4-1t-a52b", "openai-gpt-oss-120b"],
   // Native opencode subagents (always shipped). general is a versatile
   // read+write helper; explore is read-only search.
   general:    ["deepseek-v4-flash-0731", "qwen3-coder-next"],
@@ -2897,36 +2933,60 @@ const setup = async (ctx) => {
   installPacer(keys);
   pacerDebugLog(`pacer: ${keys.length} SAIA key(s) in rotation, timeout=${TIMEOUT_MS}ms (opencode v2)`);
 
-  const ready = publishModels(await loadSaiaModels(keys[0]));
-  if (ready.length) {
-    await ctx.provider.transform((draft) => {
-      // No apiKey here: opencode hands the provider its stored credential
-      // itself. A test baseURL must win, or fault injection spends real SAIA
-      // requests.
-      if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) {
-        draft.update("saia-gwdg", (p) => {
-          p.settings = { ...(p.settings ?? {}), baseURL: SAIA_BASE_URL };
-        });
-        pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
-      }
-      for (const m of ready) {
-        draft.models.update("saia-gwdg", m.id, (x) => {
-          x.name = m.name ?? m.id;
-          x.capabilities = {
-            ...(x.capabilities ?? {}),
-            tools: true,
-            // opencode gates every agent temperature on this flag; all SAIA
-            // models are OpenAI-compatible completions endpoints.
-            temperature: true,
-            input: Array.isArray(m.input) && m.input.length ? m.input.filter((t) => ["text", "image", "audio", "video", "pdf"].includes(t)) : ["text"],
-            output: ["text"],
-          };
-        });
-      }
-    });
-    pacerDebugLog(`v2: ${ready.length} SAIA model(s) registered`);
-  } else {
-    pacerDebugLog("v2: no ready SAIA models (no cache, fetch failed) — provider left empty");
+  // v2 replays the provider transform on every registry rebuild, so the
+  // callback below reads this holder rather than a startup constant:
+  // refreshModels() swaps in a fresh list and reloads, and the next registry
+  // read re-registers the models from it (the documented v2 pattern for
+  // inputs that change after setup; verified on 2.2.5).
+  const models = { ready: [] };
+
+  // Loads the SAIA catalog with `key`, publishes the ready/reasoning sets for
+  // the pacer (effort injection, unready-model remap) and makes opencode
+  // replay the transform above with the new list. Returns the ready count.
+  const refreshModels = async (key) => {
+    models.ready = publishModels(await loadSaiaModels(key));
+    if (!models.ready.length) {
+      pacerDebugLog("v2: no ready SAIA models (no cache, fetch failed) — provider left empty");
+      return 0;
+    }
+    // Marks the registry changed so the next model read replays the
+    // transform with the freshly published list.
+    await ctx.provider.reload();
+    pacerDebugLog(`v2: ${models.ready.length} SAIA model(s) registered`);
+    return models.ready.length;
+  };
+
+  await ctx.provider.transform((draft) => {
+    // No apiKey here: opencode hands the provider its stored credential
+    // itself. A test baseURL must win, or fault injection spends real SAIA
+    // requests.
+    if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) {
+      draft.update("saia-gwdg", (p) => {
+        p.settings = { ...(p.settings ?? {}), baseURL: SAIA_BASE_URL };
+      });
+      pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
+    }
+    for (const m of models.ready) {
+      draft.models.update("saia-gwdg", m.id, (x) => {
+        x.name = m.name ?? m.id;
+        x.capabilities = {
+          ...(x.capabilities ?? {}),
+          tools: true,
+          // opencode gates every agent temperature on this flag; all SAIA
+          // models are OpenAI-compatible completions endpoints.
+          temperature: true,
+          input: Array.isArray(m.input) && m.input.length ? m.input.filter((t) => ["text", "image", "audio", "video", "pdf"].includes(t)) : ["text"],
+          output: ["text"],
+        };
+      });
+    }
+  });
+
+  try {
+    await refreshModels(keys[0]);
+  } catch (e) {
+    // A failed registration must not take down hooks and the event loop.
+    pacerDebugLog(`v2: initial model registration failed: ${String(e?.message ?? e).slice(0, 160)}`);
   }
 
   const hooks = await server({ client: v2ClientShim(ctx), directory: ctx.location?.directory });
@@ -2943,11 +3003,28 @@ const setup = async (ctx) => {
         // A key stored or switched later (`opencode auth login saia-gwdg`)
         // must reach the pacer, which rewrites every request's Authorization:
         // the background service outlives the key that was active at setup().
+        // It must also heal the model list: a startup on a stale/expired key
+        // leaves the provider empty (the /models fetch 401s and there is no
+        // cache yet), and without this the set stays empty until the next
+        // plugin reload or restart — even though a working key arrived
+        // seconds later.
         if (CREDENTIAL_EVENT_TYPES.includes(evt.type)) {
           const next = saiaKeys(await storedSaiaKey(ctx));
           if (next && next[0] !== globalThis.__saiaKeys?.[0]) {
             installPacer(next);
             pacerDebugLog(`pacer: stored saia-gwdg key changed (…${next[0].slice(-4)}) — ${next.length} key(s) in rotation`);
+          }
+          // Runs for any stored key while the provider is empty, so a re-login
+          // with the same key or an unrelated credential event also heals a
+          // startup that failed on a transient outage.
+          if (next && !models.ready.length) {
+            try {
+              const n = await refreshModels(next[0]);
+              if (n) pacerDebugLog(`v2: recovered ${n} SAIA model(s) into the provider after credential event`);
+            } catch (e) {
+              // Never let this kill the event loop: it also feeds auto-resume.
+              pacerDebugLog(`v2: model recovery after credential event failed: ${String(e?.message ?? e).slice(0, 160)}`);
+            }
           }
           continue;
         }
