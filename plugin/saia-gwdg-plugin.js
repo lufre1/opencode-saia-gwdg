@@ -2283,36 +2283,60 @@ const setup = async (ctx) => {
   installPacer(keys);
   pacerDebugLog(`pacer: ${keys.length} SAIA key(s) in rotation, timeout=${TIMEOUT_MS}ms (opencode v2)`);
 
-  const ready = publishModels(await loadSaiaModels(keys[0]));
-  if (ready.length) {
-    await ctx.provider.transform((draft) => {
-      // No apiKey here: opencode hands the provider its stored credential
-      // itself. A test baseURL must win, or fault injection spends real SAIA
-      // requests.
-      if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) {
-        draft.update("saia-gwdg", (p) => {
-          p.settings = { ...(p.settings ?? {}), baseURL: SAIA_BASE_URL };
-        });
-        pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
-      }
-      for (const m of ready) {
-        draft.models.update("saia-gwdg", m.id, (x) => {
-          x.name = m.name ?? m.id;
-          x.capabilities = {
-            ...(x.capabilities ?? {}),
-            tools: true,
-            // opencode gates every agent temperature on this flag; all SAIA
-            // models are OpenAI-compatible completions endpoints.
-            temperature: true,
-            input: Array.isArray(m.input) && m.input.length ? m.input.filter((t) => ["text", "image", "audio", "video", "pdf"].includes(t)) : ["text"],
-            output: ["text"],
-          };
-        });
-      }
-    });
-    pacerDebugLog(`v2: ${ready.length} SAIA model(s) registered`);
-  } else {
-    pacerDebugLog("v2: no ready SAIA models (no cache, fetch failed) — provider left empty");
+  // v2 replays the provider transform on every registry rebuild, so the
+  // callback below reads this holder rather than a startup constant:
+  // refreshModels() swaps in a fresh list and reloads, and the next registry
+  // read re-registers the models from it (the documented v2 pattern for
+  // inputs that change after setup; verified on 2.2.5).
+  const models = { ready: [] };
+
+  // Loads the SAIA catalog with `key`, publishes the ready/reasoning sets for
+  // the pacer (effort injection, unready-model remap) and makes opencode
+  // replay the transform above with the new list. Returns the ready count.
+  const refreshModels = async (key) => {
+    models.ready = publishModels(await loadSaiaModels(key));
+    if (!models.ready.length) {
+      pacerDebugLog("v2: no ready SAIA models (no cache, fetch failed) — provider left empty");
+      return 0;
+    }
+    // Marks the registry changed so the next model read replays the
+    // transform with the freshly published list.
+    await ctx.provider.reload();
+    pacerDebugLog(`v2: ${models.ready.length} SAIA model(s) registered`);
+    return models.ready.length;
+  };
+
+  await ctx.provider.transform((draft) => {
+    // No apiKey here: opencode hands the provider its stored credential
+    // itself. A test baseURL must win, or fault injection spends real SAIA
+    // requests.
+    if (SAIA_BASE_URL !== SAIA_PROD_BASE_URL) {
+      draft.update("saia-gwdg", (p) => {
+        p.settings = { ...(p.settings ?? {}), baseURL: SAIA_BASE_URL };
+      });
+      pacerDebugLog(`baseURL overridden to ${SAIA_BASE_URL} (SAIA_BASE_URL is set)`);
+    }
+    for (const m of models.ready) {
+      draft.models.update("saia-gwdg", m.id, (x) => {
+        x.name = m.name ?? m.id;
+        x.capabilities = {
+          ...(x.capabilities ?? {}),
+          tools: true,
+          // opencode gates every agent temperature on this flag; all SAIA
+          // models are OpenAI-compatible completions endpoints.
+          temperature: true,
+          input: Array.isArray(m.input) && m.input.length ? m.input.filter((t) => ["text", "image", "audio", "video", "pdf"].includes(t)) : ["text"],
+          output: ["text"],
+        };
+      });
+    }
+  });
+
+  try {
+    await refreshModels(keys[0]);
+  } catch (e) {
+    // A failed registration must not take down hooks and the event loop.
+    pacerDebugLog(`v2: initial model registration failed: ${String(e?.message ?? e).slice(0, 160)}`);
   }
 
   const hooks = await server({ client: v2ClientShim(ctx), directory: ctx.location?.directory });
@@ -2329,11 +2353,28 @@ const setup = async (ctx) => {
         // A key stored or switched later (`opencode auth login saia-gwdg`)
         // must reach the pacer, which rewrites every request's Authorization:
         // the background service outlives the key that was active at setup().
+        // It must also heal the model list: a startup on a stale/expired key
+        // leaves the provider empty (the /models fetch 401s and there is no
+        // cache yet), and without this the set stays empty until the next
+        // plugin reload or restart — even though a working key arrived
+        // seconds later.
         if (CREDENTIAL_EVENT_TYPES.includes(evt.type)) {
           const next = saiaKeys(await storedSaiaKey(ctx));
           if (next && next[0] !== globalThis.__saiaKeys?.[0]) {
             installPacer(next);
             pacerDebugLog(`pacer: stored saia-gwdg key changed (…${next[0].slice(-4)}) — ${next.length} key(s) in rotation`);
+          }
+          // Runs for any stored key while the provider is empty, so a re-login
+          // with the same key or an unrelated credential event also heals a
+          // startup that failed on a transient outage.
+          if (next && !models.ready.length) {
+            try {
+              const n = await refreshModels(next[0]);
+              if (n) pacerDebugLog(`v2: recovered ${n} SAIA model(s) into the provider after credential event`);
+            } catch (e) {
+              // Never let this kill the event loop: it also feeds auto-resume.
+              pacerDebugLog(`v2: model recovery after credential event failed: ${String(e?.message ?? e).slice(0, 160)}`);
+            }
           }
           continue;
         }

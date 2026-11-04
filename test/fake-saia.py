@@ -11,6 +11,10 @@ Point opencode at it with:
 
 Behaviour is chosen per request by the `mode` query parameter, falling back to
 the FAKE_SAIA_MODE environment variable. See MODES below.
+
+FAKE_SAIA_MODELS_KEY=<key> gates GET /v1/models on the Authorization header
+(401 for any other key) so a "startup on an expired key" can be replayed; chat
+requests are unaffected.
 """
 import json
 import os
@@ -39,6 +43,10 @@ MODES = {
 
 PORT = int(os.environ.get("FAKE_SAIA_PORT", "8787"))
 DEFAULT_MODE = os.environ.get("FAKE_SAIA_MODE", "ok")
+# When set, GET /v1/models answers 401 unless the request carries this key —
+# the expired-key startup that leaves the provider empty until a credential
+# event heals it (test/v2-setup.mjs "rejected key" case).
+MODELS_KEY = os.environ.get("FAKE_SAIA_MODELS_KEY")
 MODEL = "fake-model-1"
 STALL_SECONDS = 600  # "forever" as far as any plugin deadline is concerned
 
@@ -100,6 +108,9 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ routes
     def do_GET(self):
         if self.path.split("?")[0].endswith("/models"):
+            if MODELS_KEY and self.headers.get("Authorization") != f"Bearer {MODELS_KEY}":
+                self._json({"error": "key expired"}, 401)
+                return
             self._json({
                 "data": [
                     {"id": MODEL, "name": "Fake Model", "status": "ready",

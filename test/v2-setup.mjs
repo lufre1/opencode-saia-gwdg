@@ -17,6 +17,9 @@
 //
 //   - the key comes from opencode's credential store (ctx.integration), is
 //     not injected into the provider, and a key switched later reaches the wire
+//   - a startup on a rejected key (/models 401, no cache) leaves the provider
+//     empty but alive, and a credential.updated with a working key refills it
+//     without a restart
 //
 // Fully isolated: HOME points at a temp dir holding a fake models cache, the
 // stored key is a fake ctx.integration, so the real ~/.cache/opencode files
@@ -24,7 +27,7 @@
 // Zero real SAIA requests.
 //
 // Usage: node test/v2-setup.mjs
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, openSync } from "fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, openSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { spawn } from "child_process";
@@ -66,7 +69,7 @@ writeFileSync(process.env.SAIA_BUDGET_PATH, "{}");
 // Windows has no python3 alias; python is the interpreter there.
 const PY = process.platform === "win32" ? "python" : "python3";
 const srv = spawn(PY, [join(import.meta.dirname, "fake-saia.py")], {
-  env: { ...process.env, FAKE_SAIA_MODE: "ok", FAKE_SAIA_PORT: String(PORT) },
+  env: { ...process.env, FAKE_SAIA_MODE: "ok", FAKE_SAIA_PORT: String(PORT), FAKE_SAIA_MODELS_KEY: "good-key" },
   stdio: ["ignore", "ignore", openSync(SRVLOG, "w")],
 });
 await new Promise((r) => setTimeout(r, 700));
@@ -97,6 +100,16 @@ const check = (name, cond, detail = "") => {
 };
 const pacerLines = () => readFileSync(LOG, "utf-8").split("\n").filter(Boolean);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Polls cond() until true — the recovery /models fetch goes through the
+// pacer (>=5.1s request spacing), so a fixed sleep would race it.
+const waitFor = async (cond, ms = 15000) => {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > ms) return false;
+    await sleep(200);
+  }
+  return true;
+};
 
 // --- fake v2 ctx -----------------------------------------------------------
 const registered = new Map();
@@ -111,6 +124,30 @@ const push = (evt) => {
 };
 // opencode's credential store, as the 2.2.5 binary returns it.
 let storedKey = "test-key";
+// Mirrors the real 2.2.5 provider registry (verified by reload-probe): a
+// transform callback is stored and replayed on every registry rebuild, and
+// provider.reload() marks the registry changed so the next read replays every
+// stored transform against current state. A reload with a fresh model list is
+// how setup()'s refreshModels() publishes models.
+const transforms = [];
+let reloads = 0;
+const draft = {
+  update: (providerID, fn) => {
+    const p = providers.get(providerID) ?? { id: providerID, settings: { baseURL: "https://chat-ai.academiccloud.de/v1" } };
+    fn(p);
+    providers.set(providerID, p);
+  },
+  models: {
+    update: (providerID, modelID, fn) => {
+      const m = { id: modelID, providerID, capabilities: { tools: true, input: ["text", "image"], output: ["text"] } };
+      fn(m);
+      registered.set(`${providerID}/${modelID}`, m);
+    },
+  },
+};
+const replayTransforms = () => {
+  for (const cb of transforms) cb(draft);
+};
 const ctx = {
   location: { directory: work },
   integration: {
@@ -121,21 +158,13 @@ const ctx = {
   },
   provider: {
     transform: async (cb) => {
-      cb({
-        update: (providerID, fn) => {
-          const p = providers.get(providerID) ?? { id: providerID, settings: { baseURL: "https://chat-ai.academiccloud.de/v1" } };
-          fn(p);
-          providers.set(providerID, p);
-        },
-        models: {
-          update: (providerID, modelID, fn) => {
-            const m = { id: modelID, providerID, capabilities: { tools: true, input: ["text", "image"], output: ["text"] } };
-            fn(m);
-            registered.set(`${providerID}/${modelID}`, m);
-          },
-        },
-      });
+      transforms.push(cb);
+      replayTransforms(); // first registration replays immediately
       return { dispose: async () => {} };
+    },
+    reload: async () => {
+      reloads++;
+      replayTransforms();
     },
   },
   tool: {
@@ -342,6 +371,52 @@ console.log("case: key switched in opencode reaches the pacer");
   await resp.text();
   check("change logged", pacerLines().some((l) => l.includes("stored saia-gwdg key changed (…-key)")), pacerLines().slice(-2).join(" | "));
   check("new key on the wire", wireAuth.at(-1) === "Bearer rotated-key", String(wireAuth.at(-1)));
+}
+
+console.log("case: startup on a rejected key heals after a credential event");
+{
+  // fake-saia.py 401s /models for every key but good-key, and the models
+  // cache is gone, so this setup replays the 2026-11-04 service boot: fetch
+  // fails, no stale cache, provider left empty. It must NOT crash — and the
+  // credential.updated that brings a working key must refill the provider
+  // without a restart (the live bug: only the pacer was refreshed).
+  const GOOD = "good-key";
+  const linesBefore = pacerLines().length;
+  const reloadsBefore = reloads;
+  storedKey = "expired-key";
+  rmSync(join(home, ".cache/opencode/saia-gwdg-models.json"));
+  // This setup subscribes the event loop that now owns the queue (the mock's
+  // wake slot is last-subscriber-wins), so its credential event reaches THIS
+  // setup's handler — the one holding the empty model list.
+  const cleanup2 = await mod.default.setup(ctx);
+  check("empty startup logged", pacerLines().slice(linesBefore).some((l) => l.includes("provider left empty")), pacerLines().slice(linesBefore).join(" | ").slice(0, 200));
+  check("no provider reload while empty", reloads === reloadsBefore, `reloads=${reloads}`);
+  check("rejected startup registered nothing", !registered.has("saia-gwdg/fake-model-1"));
+
+  storedKey = GOOD;
+  push({ type: "credential.updated", data: { integrationID: "saia-gwdg", credentialID: "cred_test" } });
+  check(
+    "recovery line logged",
+    await waitFor(() => pacerLines().slice(linesBefore).some((l) => l.includes("recovered 2 SAIA model(s) into the provider after credential event"))),
+    pacerLines().slice(-6).join(" | ").slice(0, 300)
+  );
+  check("recovered model registered", registered.has("saia-gwdg/fake-model-1"), [...registered.keys()].join(","));
+  check("reasoning set republished", globalThis.__saiaReasoning?.has("fake-reasoner-1") === true);
+  check("provider reloaded by the recovery", reloads > reloadsBefore, `reloads=${reloads}`);
+  check("key change logged", pacerLines().slice(linesBefore).some((l) => l.includes("stored saia-gwdg key changed (…-key)")));
+
+  // With models registered, a later credential event must not redo the work.
+  const reloadsAfter = reloads;
+  push({ type: "credential.updated", data: { integrationID: "saia-gwdg", credentialID: "cred_test" } });
+  await sleep(400);
+  check("no redundant reload once registered", reloads === reloadsAfter, `reloads=${reloads}`);
+  let err2 = null;
+  try {
+    await cleanup2();
+  } catch (e) {
+    err2 = e;
+  }
+  check("second cleanup ran", err2 === null, String(err2?.message ?? ""));
 }
 
 console.log("case: cleanup");
