@@ -7,6 +7,9 @@
 //   - setup installs the pacer and registers the ready SAIA models
 //   - wire templating: __SAIA_BUDGET_STATUS__ and the coder2 -> coder prompt
 //     swap land in SYSTEM messages only; an unready model is remapped
+//   - reasoning effort on the wire: a Mistral model gets a TOP-LEVEL
+//     reasoning_effort (max aliased to high; off leaves the request
+//     untouched), a chat-template model keeps chat_template_kwargs
 //   - the "subagent" tool hook is registered and passes on an unknown budget
 //   - v2 events drive auto-resume: execution.failed schedules a resume that
 //     fires session.prompt; execution.interrupted is never resumed
@@ -31,6 +34,7 @@ const work = mkdtempSync(join(tmpdir(), "saia-v2-"));
 const home = join(work, "home");
 mkdirSync(join(home, ".local/share/opencode"), { recursive: true });
 mkdirSync(join(home, ".cache/opencode"), { recursive: true });
+mkdirSync(join(home, ".config/opencode"), { recursive: true });
 writeFileSync(
   join(home, ".cache/opencode/saia-gwdg-models.json"),
   JSON.stringify({
@@ -40,9 +44,13 @@ writeFileSync(
       { id: "qwen3-coder-next", name: "Qwen3 Coder Next", status: "ready", input: ["text"], output: ["text"] },
       { id: "deepseek-v4-flash-0731", name: "DeepSeek V4 Flash", status: "ready", input: ["text"], output: ["text", "thought"] },
       { id: "glm-5.3-flash", name: "GLM 5.3 Flash", status: "offline", input: ["text"], output: ["text", "thought"] },
+      // What SAIA really reports for it (ready, thought output — reasoning set
+      // picks it up without FORCE_REASONING).
+      { id: "mistral-large-4-1t-a52b", name: "Mistral Large 4 1T A52B", status: "ready", input: ["text", "image"], output: ["text", "thought"] },
     ],
   })
 );
+const setEffort = (level) => writeFileSync(join(home, ".config/opencode/effort.json"), JSON.stringify({ level }));
 const LOG = join(work, "pacer.log");
 const SRVLOG = join(work, "server.log");
 writeFileSync(LOG, "");
@@ -228,6 +236,39 @@ console.log("case: wire templating");
   // glm-5.3-flash's role is solo (its first ROLE_MODELS list); solo's next
   // entry is deepseek-v4-flash-0731, which is ready.
   check("unready model remapped within its role", sent?.model === "deepseek-v4-flash-0731", `model=${sent?.model}`);
+}
+
+console.log("case: reasoning effort on the wire");
+{
+  const post = (model) =>
+    fetch(`http://127.0.0.1:${PORT}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model, stream: true, messages: [{ role: "user", content: "hi" }] }),
+    }).then((r) => r.text());
+  // Mistral tokenizer models reject chat_template_kwargs (400); their effort
+  // goes top-level, with the ladder capped by EFFORT_ALIAS (max -> high).
+  setEffort("max");
+  await post("mistral-large-4-1t-a52b");
+  let sent = wire.at(-1);
+  check("mistral effort sent top-level", sent?.reasoning_effort === "high", JSON.stringify(sent?.reasoning_effort));
+  check("mistral gets no chat_template_kwargs", sent?.chat_template_kwargs === undefined, JSON.stringify(sent?.chat_template_kwargs));
+  // `off` is not expressible top-level — the request must pass untouched.
+  setEffort("off");
+  await sleep(1100); // readEffort caches for 1s
+  await post("mistral-large-4-1t-a52b");
+  sent = wire.at(-1);
+  check("mistral off leaves the request untouched", sent?.reasoning_effort === undefined && sent?.chat_template_kwargs === undefined);
+  // A chat-template model keeps the kwargs path.
+  setEffort("medium");
+  await sleep(1100);
+  await post("deepseek-v4-flash-0731");
+  sent = wire.at(-1);
+  check(
+    "template model keeps chat_template_kwargs",
+    sent?.chat_template_kwargs?.enable_thinking === true && sent?.chat_template_kwargs?.reasoning_effort === "medium",
+    JSON.stringify(sent?.chat_template_kwargs)
+  );
 }
 
 console.log("case: test-mode routing");

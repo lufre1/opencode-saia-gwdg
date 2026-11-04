@@ -613,10 +613,13 @@ function installPacer(keys) {
     );
   };
 
-  // Inject chat_template_kwargs into the JSON body of a chat-completions
-  // request for reasoning-capable models. Returns a new init with the rewritten
-  // body, or the original init when nothing applies. `reasoningModels` is the
-  // set of model ids whose output advertises `thought`.
+  // Inject the reasoning-effort setting into the JSON body of a
+  // chat-completions request for reasoning-capable models: as
+  // chat_template_kwargs normally, or as a top-level reasoning_effort field
+  // for the models in TOP_LEVEL_EFFORT_MODELS (declared further down, near
+  // EFFORT_ALIAS). Returns a new init with the rewritten body, or the original
+  // init when nothing applies. `reasoningModels` is the set of model ids whose
+  // output advertises `thought`.
   const withEffort = (input, init, url, reasoningModels) => {
     if (!url.pathname.endsWith("/chat/completions")) return init;
     let body = init?.body;
@@ -632,6 +635,23 @@ function installPacer(keys) {
     if (!reasoningModels.has(baseId)) return init;
     const level = readEffort();
     const mapped = EFFORT_ALIAS[baseId]?.[level] ?? level;
+    // Mistral-tokenizer models reject chat_template_kwargs outright (400
+    // "chat_template is not supported for Mistral tokenizers", verified
+    // 2026-11-04) but accept the effort as a TOP-LEVEL reasoning_effort field
+    // (ladder low/medium/high, verified the same day). `off` is not
+    // expressible top-level: leave the request untouched and let the model
+    // think at its default.
+    if (TOP_LEVEL_EFFORT_MODELS.has(baseId)) {
+      if (level === "off") {
+        pacerDebugLog(`effort=off not expressible top-level for ${parsed.model} — default thinking`);
+        return init;
+      }
+      parsed.reasoning_effort = mapped;
+      pacerDebugLog(
+        `effort=${level}${mapped !== level ? `->${mapped}` : ""} set top-level for ${parsed.model}`
+      );
+      return { ...init, body: JSON.stringify(parsed) };
+    }
     parsed.chat_template_kwargs = effortKwargs(mapped);
     pacerDebugLog(
       `effort=${level}${mapped !== level ? `->${mapped}` : ""} injected for ${parsed.model}`
@@ -1253,7 +1273,20 @@ const FORCE_REASONING = new Set([
 // its own top rung. `off` is never remapped — every model accepts it.
 const EFFORT_ALIAS = {
   "qwen3.8-27b": { high: "xhigh", max: "xhigh" },
+  // Ladder is low/medium/high: probed 2026-11-04, max -> 400 "reasoning_effort
+  // should be one of ['low', 'medium', 'high'], got max."
+  "mistral-large-4-1t-a52b": { max: "high" },
 };
+
+// Models whose serving stack rejects chat_template_kwargs categorically:
+// SAIA answers 400 "chat_template is not supported for Mistral tokenizers.
+// (parameter=chat_template)" — verified on-wire 2026-11-04 (request without
+// kwargs -> 200, with kwargs -> 400, same key, minutes apart). These models
+// receive the /effort level as a TOP-LEVEL reasoning_effort field instead
+// (same day: 200, reasoning_tokens in the usage, level honored). /effort off
+// is not expressible top-level, so it leaves the model at its default
+// thinking.
+const TOP_LEVEL_EFFORT_MODELS = new Set(["mistral-large-4-1t-a52b"]);
 
 // Preferred model per agent role, best first. The plugin picks the first entry
 // that SAIA currently reports as `ready`; if none are ready it falls back to any
@@ -1271,7 +1304,7 @@ const ROLE_MODELS = {
   // Solo workhorse: a thinking model for the one full-context session that
   // plans, implements and self-checks. glm-5.3-flash's 2026-09-09
   // headers-timeout incident is what the model-health breaker below is for.
-  solo:       ["glm-5.3-flash", "deepseek-v4-flash-0731"],
+  solo:       ["glm-5.3-flash", "deepseek-v4-flash-0731", "mistral-large-4-1t-a52b"],
   // Orchestrator: best rule-following per request; deepseek-v4-flash demoted
   // (ignores prompt rules under task pressure — verified 2026-07-13).
   auto:       ["qwen3.8-27b", "deepseek-v4-flash-0731"],
@@ -1283,9 +1316,12 @@ const ROLE_MODELS = {
   plan:       ["deepseek-v4-flash-0731", "qwen3.8-27b", "glm-5.3-flash"],
   build:      ["qwen3.8-27b", "qwen3-coder-next"],
   // Fix rounds run on a DIFFERENT model family to break correlated errors
-  // (glm vs the qwen primary on coder).
-  coder2:     ["glm-5.3-flash", "qwen3-coder-next"],
-  debugger:   ["qwen3-coder-next", "openai-gpt-oss-120b"],
+  // (glm vs the qwen primary on coder). Mistral is a third family, added
+  // 2026-11-04 as the middle fallback.
+  coder2:     ["glm-5.3-flash", "mistral-large-4-1t-a52b", "qwen3-coder-next"],
+  // openai-gpt-oss-120b is no longer on SAIA's list, so mistral (added
+  // 2026-11-04) is the live second fallback here.
+  debugger:   ["qwen3-coder-next", "mistral-large-4-1t-a52b", "openai-gpt-oss-120b"],
   // Native opencode subagents (always shipped). general is a versatile
   // read+write helper; explore is read-only search.
   general:    ["deepseek-v4-flash-0731", "qwen3-coder-next"],
