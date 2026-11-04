@@ -8,7 +8,10 @@ rem Runs the installer under Git Bash, the same bash opencode uses on Windows.
 rem Deliberately NOT plain "bash": on Windows that is usually WSL's
 rem System32\bash.exe, which would install into the WSL home where the
 rem Windows opencode never looks. No labels/goto: safe with LF line endings.
+rem UTF-8 codepage: the installer's messages use em dashes (UTF-8); without
+rem this cmd renders them as mojibake in its default OEM codepage.
 setlocal
+chcp 65001 >nul
 set "GITBASH=%OPENCODE_GIT_BASH_PATH%"
 if not defined GITBASH for /f "delims=" %%G in ('where git 2^>nul') do if not defined GITBASH set "GITBASH=%%~dpG..\bin\bash.exe"
 if not exist "%GITBASH%" set "GITBASH=%ProgramFiles%\Git\bin\bash.exe"

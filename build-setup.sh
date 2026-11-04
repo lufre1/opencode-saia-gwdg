@@ -204,10 +204,14 @@ Options:
   -h, --help       show this help
 
 The API key is taken from the GWDG_API_KEY environment variable if set,
-otherwise prompted for interactively. Files that would be overwritten are
-backed up to ~/.config/opencode.bak-<timestamp>/ first. Without opencode
-installed no key is stored; run 'opencode auth login saia-gwdg --standalone'
-later.
+otherwise prompted for interactively (with opencode installed and a key
+already stored, you are asked whether to keep it — answer 'n' to enter a
+new one). It is checked against SAIA (GET /v1/models, the key piped to
+curl on stdin, never on a command line) BEFORE any file is written: an
+expired/revoked key aborts the run with SAIA's own message and leaves the
+existing install untouched. Files that would be overwritten are backed up
+to ~/.config/opencode.bak-<timestamp>/ first. Without opencode installed
+no key is stored; run 'opencode auth login saia-gwdg --standalone' later.
 USAGE
 }
 
@@ -403,8 +407,183 @@ write_file() {  # $1 = path relative to CONFIG_DIR; content on stdin
   log "  wrote: $dest"
 }
 
+# ── API key: resolve + validate BEFORE any file is rewritten ──────────
+# A rejected key (expired/revoked) makes the plugin register zero models, so
+# opencode shows no SAIA models and silently falls back to another provider —
+# the install looks broken while every file is in place. Check the key first,
+# while the existing config is still untouched; a 401 aborts the run.
+SAIA_MODELS_URL="https://chat-ai.academiccloud.de/v1/models"
+KEY=""            # the key this run has resolved (empty: none available yet)
+KEY_SOURCE=""     # stored | env | legacy | prompted
+KEY_ERROR=""      # SAIA's own error message from the last check
+KEY_HTTP=""       # HTTP status of the last check
+
+# Trims leading/trailing whitespace. A trailing \r (Windows env var) or a
+# pasted newline turns into an invalid Authorization header and a 401.
+trim_key() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# The saia-gwdg key of an install from before the credential store (auth.json,
+# which opencode v2 never reads). Empty when there is none.
+legacy_key() {
+  [[ -f "$AUTH_FILE" ]] || return 0
+  AUTH_FILE="$AUTH_FILE" $PY -c '
+import json, os
+print(json.load(open(os.environ["AUTH_FILE"])).get("saia-gwdg", {}).get("key", ""))
+' 2>/dev/null || true
+}
+
+# GET /v1/models with one key: 0 = accepted, 1 = rejected (401/403), 2 = could
+# not verify (network/other HTTP). Sets KEY_HTTP and KEY_ERROR.
+check_saia_key() {
+  local resp code body
+  KEY_ERROR=""; KEY_HTTP=""
+  if ! command -v curl >/dev/null 2>&1; then
+    KEY_ERROR="curl not found"
+    return 2
+  fi
+  # The key travels in a curl config on stdin (-K -), never on the command
+  # line: argv is visible in ps / Task Manager / WMI — the same invariant the
+  # opencode auth calls keep ("key never on a command line").
+  if ! resp="$(printf 'header = "Authorization: Bearer %s"\n' "$1" | \
+      curl -sS --max-time 30 -K - -w '\n%{http_code}' "$SAIA_MODELS_URL" 2>/dev/null)"; then
+    KEY_ERROR="network error"
+    return 2
+  fi
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  KEY_HTTP="$code"
+  KEY_ERROR="$(printf '%s' "$body" | $PY -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print((d.get("error") or {}).get("message") or d.get("message") or "")
+except Exception:
+    print("")
+' 2>/dev/null)" || KEY_ERROR=""
+  case "$code" in
+    200) return 0 ;;
+    401|403) return 1 ;;
+    *) KEY_ERROR="${KEY_ERROR:-HTTP $code}"; return 2 ;;
+  esac
+}
+
+# Whether `opencode auth list` shows a stored saia-gwdg credential — the same
+# command setup_auth_key trusts to keep a key. Used when `auth export` fails
+# (older opencode without that subcommand, transient private-server error):
+# a key IS stored, it just cannot be read out for validation.
+saia_cred_stored() {
+  opencode auth list --standalone --format json 2>/dev/null | $PY -c '
+import json, sys
+try:
+    for i in json.load(sys.stdin):
+        if i.get("id") == "saia-gwdg":
+            if any(c.get("type") == "credential" for c in i.get("connections", [])):
+                print("yes")
+            break
+except Exception:
+    pass
+' 2>/dev/null | grep -q '^yes$'
+}
+
+# Same precedence as setup_auth_key: an existing stored key wins unless
+# --force-key, then GWDG_API_KEY, then the legacy auth.json key, then a prompt.
+resolve_saia_key() {
+  local stored="" k="" reply=""
+  if [[ $OPENCODE_MISSING -eq 0 ]]; then
+    stored="$(opencode auth export saia-gwdg --standalone 2>/dev/null | $PY -c '
+import json, sys
+try:
+    creds = [c for c in json.load(sys.stdin)
+             if c.get("integrationID") == "saia-gwdg"
+             and c.get("value", {}).get("type") == "key"]
+    creds.sort(key=lambda c: not c.get("active"))
+    print(creds[0]["value"]["key"] if creds else "")
+except Exception:
+    print("")
+' 2>/dev/null)" || stored=""
+    stored="$(trim_key "$stored")"
+  fi
+  if [[ -n "$stored" && $FORCE_KEY -eq 0 ]]; then
+    KEY="$stored"; KEY_SOURCE=stored
+    # Interactive runs get a say: silently reusing a stored key reads as
+    # "it never asked me for my key". Enter keeps it; anything starting with
+    # n/N asks for a new one (same effect as --force-key from here on).
+    if [[ -t 0 ]]; then
+      read -r -p "An saia-gwdg API key is already stored — keep it? [Y/n] " reply
+      if [[ $reply == [nN]* ]]; then
+        FORCE_KEY=1
+        KEY=""; KEY_SOURCE=""
+      fi
+    fi
+    [[ -n "$KEY" ]] && return 0
+  fi
+  if [[ $FORCE_KEY -eq 0 && $OPENCODE_MISSING -eq 0 ]] && saia_cred_stored; then
+    # auth export failed but a key IS stored: keep it rather than fall through
+    # to a prompt — a prompt here would import a new key and log the stored,
+    # possibly perfectly valid one out in setup_auth_key. Kept unvalidated.
+    KEY=""; KEY_SOURCE=stored
+    log "NOTE: could not read the stored saia-gwdg key for validation"
+    log "      ('opencode auth export' failed) — it will be kept unchanged."
+    return 0
+  fi
+  k="$(trim_key "${GWDG_API_KEY:-}")"
+  if [[ -n "$k" ]]; then
+    KEY_SOURCE=env
+  elif [[ $FORCE_KEY -eq 0 ]]; then
+    k="$(trim_key "$(legacy_key)")"
+    [[ -n "$k" ]] && KEY_SOURCE=legacy
+  fi
+  if [[ -z "$k" ]]; then
+    # Without opencode nothing can be stored; setup_auth_key prints the login
+    # hint instead. With opencode, get the key now, before anything is written.
+    [[ $OPENCODE_MISSING -eq 1 ]] && return 0
+    if [[ -t 0 ]]; then
+      read -r -s -p "Enter your GWDG/SAIA API key (Academic Cloud portal): " k
+      echo
+      k="$(trim_key "$k")"
+      [[ -n "$k" ]] && KEY_SOURCE=prompted
+    else
+      die "No GWDG_API_KEY set and no terminal to prompt — export GWDG_API_KEY and rerun."
+    fi
+  fi
+  KEY="$k"
+}
+
+validate_saia_key() {
+  [[ -n "$KEY" ]] || return 0
+  local st=0 where="the API key"
+  check_saia_key "$KEY" || st=$?
+  case "$st" in
+    0)
+      log "API key validated against SAIA (GET /v1/models)."
+      ;;
+    1)
+      case "$KEY_SOURCE" in
+        stored)   where="the stored saia-gwdg key" ;;
+        legacy)   where="the key in $AUTH_FILE" ;;
+        env)      where="GWDG_API_KEY" ;;
+        prompted) where="the key you entered" ;;
+      esac
+      die "SAIA rejected $where${KEY_ERROR:+ — \"$KEY_ERROR\"}. No SAIA files were changed.
+  Create a fresh key in the Academic Cloud portal, then either:
+    - store it:  opencode auth login saia-gwdg --standalone
+    - or rerun:  GWDG_API_KEY=<new-key> bash $0 --force-key"
+      ;;
+    *)
+      log "WARNING: could not validate the API key (${KEY_ERROR:-HTTP ${KEY_HTTP:-?}}) — continuing."
+      ;;
+  esac
+}
 
 ensure_opencode
+
+resolve_saia_key
+validate_saia_key
 
 if [[ $OPENCODE_MISSING -eq 0 ]]; then
   ensure_path_in_shellrc
@@ -465,9 +644,11 @@ cat >>"$TMP_OUT" <<'OC_GEN_FOOTER'
 # The key lives in opencode's own credential store — the only place opencode v2
 # reads keys from, and where `opencode auth login saia-gwdg` puts it. That
 # command needs a terminal for the key, so the installer pipes it to
-# `opencode auth import` on stdin instead: never on a command line. Each
-# `--standalone` call starts a private server on the installed config, so this
-# runs after the config files are final.
+# `opencode auth import` on stdin instead: never on a command line. The key was
+# resolved and validated earlier (resolve_saia_key/validate_saia_key, before
+# any file was written); this only stores the one that survived that check.
+# Each `--standalone` call starts a private server, so this runs after the
+# config files are final.
 setup_auth_key() {
   if [[ $OPENCODE_MISSING -eq 1 ]]; then
     log "No API key stored (opencode keeps it in its own credential store)."
@@ -476,35 +657,24 @@ setup_auth_key() {
     log "After installing opencode, run: opencode auth login saia-gwdg --standalone"
     return 0
   fi
-  local stored key legacy id old
+  local stored id old
   stored="$(opencode auth list --standalone --format json | $PY -c '
 import json, sys
 for i in json.load(sys.stdin):
     if i.get("id") == "saia-gwdg":
         print(" ".join(c["id"] for c in i.get("connections", []) if c.get("type") == "credential"))
 ')" || die "Could not read opencode's credentials ('opencode auth list --standalone' failed, see above)."
-  if [[ -n "$stored" && $FORCE_KEY -eq 0 ]]; then
-    log "Existing saia-gwdg API key kept (use --force-key to replace)."
+  if [[ $KEY_SOURCE == stored && $FORCE_KEY -eq 0 ]]; then
+    log "Existing saia-gwdg API key kept${KEY:+ (validated)} (use --force-key to replace)."
     drop_legacy_key
     return 0
   fi
-  key="${GWDG_API_KEY:-}"
-  legacy="$(legacy_key)"
-  if [[ -z "$key" && -n "$legacy" && $FORCE_KEY -eq 0 ]]; then
-    key="$legacy"
+  if [[ -z "$KEY" ]]; then die "No API key provided."; fi
+  if [[ $KEY_SOURCE == legacy ]]; then
     log "Moving the saia-gwdg API key from $AUTH_FILE into opencode's credential store."
   fi
-  if [[ -z "$key" ]]; then
-    if [[ -t 0 ]]; then
-      read -r -s -p "Enter your GWDG/SAIA API key (Academic Cloud portal): " key
-      echo
-    else
-      die "No GWDG_API_KEY set and no terminal to prompt — export GWDG_API_KEY and rerun."
-    fi
-  fi
-  if [[ -z "$key" ]]; then die "No API key provided."; fi
   id="cred_saia_$(date +%s)_$$"
-  KEY="$key" ID="$id" $PY -c '
+  KEY="$KEY" ID="$id" $PY -c '
 import json, os
 print(json.dumps([{"id": os.environ["ID"], "integrationID": "saia-gwdg", "label": "SAIA (GWDG)",
                    "active": True, "value": {"type": "key", "key": os.environ["KEY"]}}]))
@@ -522,16 +692,6 @@ print(json.dumps([{"id": os.environ["ID"], "integrationID": "saia-gwdg", "label"
   fi
   log "API key stored in opencode's credential store (see: opencode auth list)."
   drop_legacy_key
-}
-
-# The saia-gwdg key of an install from before the credential store (auth.json,
-# which opencode v2 never reads). Empty when there is none.
-legacy_key() {
-  [[ -f "$AUTH_FILE" ]] || return 0
-  AUTH_FILE="$AUTH_FILE" $PY -c '
-import json, os
-print(json.load(open(os.environ["AUTH_FILE"])).get("saia-gwdg", {}).get("key", ""))
-' 2>/dev/null || true
 }
 
 # Removes that old copy (backed up first); other providers' entries stay.

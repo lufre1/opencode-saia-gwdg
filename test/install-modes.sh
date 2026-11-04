@@ -14,7 +14,38 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALLER="$REPO/setup-saia-opencode.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-CLEAN_PATH=/usr/bin:/bin
+mkdir -p "$WORK/bin"
+
+# The private PATH below must still provide a working Python (the installer
+# refuses to run without one, and this script parses JSON with python3).
+# Git Bash on Windows often has a non-working python3 Store alias, so pin a
+# shim to whichever interpreter actually runs.
+REAL_PY=""
+for c in python3 python; do
+  if "$c" -c '' >/dev/null 2>&1; then REAL_PY="$(command -v "$c")"; break; fi
+done
+if [[ -z "$REAL_PY" ]] && py -3 -c '' >/dev/null 2>&1; then REAL_PY="$(command -v py)"; fi
+[[ -n "$REAL_PY" ]] || { echo "no working Python found (needed by the installer)" >&2; exit 1; }
+printf '#!/bin/bash\nexec "%s" "$@"\n' "$REAL_PY" >"$WORK/bin/python3"
+chmod 755 "$WORK/bin/python3"
+PATH="$WORK/bin:$PATH"
+
+# curl stub: the installer validates the key with GET /v1/models BEFORE writing
+# anything. The key is piped to curl as a stdin config ("-K -"), so the stub
+# logs argv and the stdin config to assert the key never appears on the
+# command line. `$HOME/key-reject` makes it answer 401 with SAIA's own message.
+cat >"$WORK/bin/curl" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >>"$HOME/curl-argv.log"
+case " $* " in *" -K - "*) cat >"$HOME/curl-stdin.log" ;; esac
+if [[ -e "$HOME/key-reject" ]]; then
+  printf '{"error":{"message":"API key has expired","type":"authentication_error"}}\n401\n'
+else
+  printf '{"data":[]}\n200\n'
+fi
+STUB
+chmod 755 "$WORK/bin/curl"
+CLEAN_PATH="$WORK/bin:/usr/bin:/bin"
 pass=0; fail=0
 
 ok()  { echo "  ok   $*"; pass=$((pass + 1)); }
@@ -37,7 +68,13 @@ done
 
 run() {  # $1 = HOME, rest = installer args; output to $1/install.log
   local home="$1"; shift   # RUN_KEY="" = no GWDG_API_KEY
-  env -i HOME="$home" PATH="$CLEAN_PATH" GWDG_API_KEY="${RUN_KEY-FAKE-KEY-install-modes}" \
+  # On Windows pass USERPROFILE too, so the installer's MSYS pin
+  # (HOME=$(cygpath -u "$USERPROFILE")) is actually exercised — env -i alone
+  # would strip it and the pin would never run in these tests. Empty on
+  # other OSes, where the pin is skipped anyway.
+  local up=""
+  case "$(uname -s)" in MINGW*|MSYS*) up="$(cygpath -w "$home")" ;; esac
+  env -i HOME="$home" USERPROFILE="$up" PATH="$CLEAN_PATH" GWDG_API_KEY="${RUN_KEY-FAKE-KEY-install-modes}" \
     bash "$INSTALLER" "$@" </dev/null >"$home/install.log" 2>&1
 }
 
@@ -123,6 +160,9 @@ case "$*" in
     [[ -e "$HOME/models-fail" ]] && { echo "Error: stub models failure" >&2; exit 1; }
     echo "saia-gwdg/stub-model" ;;
   "auth list --standalone --format json") cat "$HOME/stub-list.json" 2>/dev/null || echo "[]" ;;
+  "auth export saia-gwdg --standalone")
+    [[ -e "$HOME/export-fail" ]] && { echo "Error: unknown subcommand" >&2; exit 1; }
+    cat "$HOME/stub-export.json" 2>/dev/null || echo "[]" ;;
   "auth import --standalone") cat >"$HOME/stub-import.json"; echo "Imported 1 credential" >&2 ;;
   "auth switch saia-gwdg "*" --standalone" | "auth logout saia-gwdg "*" --standalone") echo "Done" ;;
   *) echo "Error: Background service is unresponsive" >&2; exit 1 ;;
@@ -135,10 +175,13 @@ H="$(stub_home five)"
 run "$H" --minimal; rc=$?
 check "exit 0 despite the wedged service (rc=$rc)" '[[ $rc -eq 0 ]]'
 check "verified via --standalone" 'grep -q "SUCCESS: 1 saia-gwdg models" "$H/install.log"'
-check "stuck-service warning names the pid" 'grep -q "service is stuck" "$H/install.log" && grep -q "kill 4242" "$H/install.log"'
+check "stuck-service warning names the pid" 'grep -q "service is stuck" "$H/install.log" && grep -qE "(^| )kill 4242|taskkill /F /PID 4242" "$H/install.log"'
 check "never calls service restart or plain models" '! grep -qxE "service restart|models" "$H/stub-calls.log"'
 check "key stored via opencode auth import (stdin)" 'python3 -c "import json,sys; c=json.load(open(sys.argv[1]))[0]; sys.exit(0 if (c[\"integrationID\"], c[\"value\"], c[\"active\"]) == (\"saia-gwdg\", {\"type\": \"key\", \"key\": \"FAKE-KEY-install-modes\"}, True) else 1)" "$H/stub-import.json"'
 check "key never on a command line" '! grep -q "FAKE-KEY" "$H/stub-calls.log"'
+check "validation key not on curl's command line" '! grep -q "FAKE-KEY" "$H/curl-argv.log"'
+check "validation key sent via curl stdin config" 'grep -q "Authorization: Bearer FAKE-KEY-install-modes" "$H/curl-stdin.log"'
+check "USERPROFILE set: install still went to the sandbox HOME" 'grep -q "to $H/.config/opencode" "$H/install.log" && [[ -f "$H/.config/opencode/opencode.jsonc" ]]'
 check "no auth.json written" '[[ ! -e "$H/.local/share/opencode/auth.json" ]]'
 H="$(stub_home six)"; touch "$H/models-fail"
 run "$H" --minimal; rc=$?
@@ -159,13 +202,39 @@ check "old auth.json is in the backup" 'grep -q LEGACY-KEY "$(ls -d "$H"/.config
 echo "=== 7. a stored key is kept; --force-key replaces it"
 H="$(stub_home eight)"
 echo '[{"id":"saia-gwdg","name":"SAIA (GWDG)","connections":[{"type":"credential","id":"cred_old","label":"SAIA (GWDG)","method":"key"}]}]' >"$H/stub-list.json"
+echo '[{"id":"cred_old","integrationID":"saia-gwdg","label":"SAIA (GWDG)","active":true,"value":{"type":"key","key":"OLD-KEY"}}]' >"$H/stub-export.json"
 run "$H" --minimal; rc=$?
 check "exit 0 (rc=$rc)" '[[ $rc -eq 0 ]]'
+check "stored key validated" 'grep -q "API key validated against SAIA" "$H/install.log"'
 check "kept, nothing imported" 'grep -q "Existing saia-gwdg API key kept" "$H/install.log" && [[ ! -e "$H/stub-import.json" ]]'
 run "$H" --minimal --force-key; rc=$?
 check "--force-key exit 0 (rc=$rc)" '[[ $rc -eq 0 ]]'
 NEW="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[0][\"id\"])" "$H/stub-import.json" 2>/dev/null)"
 check "new key imported, switched to, old one logged out" '[[ -n "$NEW" ]] && grep -qx "auth switch saia-gwdg $NEW --standalone" "$H/stub-calls.log" && grep -qx "auth logout saia-gwdg cred_old --standalone" "$H/stub-calls.log"'
+
+echo "=== 8. an expired/revoked key aborts before any file is written"
+H="$(new_home nine)"; touch "$H/key-reject"
+run "$H" --minimal; rc=$?
+check "exit 1 (rc=$rc)" '[[ $rc -eq 1 ]]'
+check "SAIA's own message is shown" 'grep -q "API key has expired" "$H/install.log"'
+check "nothing was written" '[[ ! -e "$H/.config/opencode" ]]'
+check "names the fix" 'grep -q "GWDG_API_KEY" "$H/install.log" && grep -q "auth login saia-gwdg --standalone" "$H/install.log"'
+
+echo "=== 9. whitespace around GWDG_API_KEY is trimmed"
+H="$(stub_home ten)"
+RUN_KEY="  FAKE-KEY-padded  " run "$H" --minimal; rc=$?
+check "exit 0 (rc=$rc)" '[[ $rc -eq 0 ]]'
+check "imported key is trimmed" 'python3 -c "import json,sys; c=json.load(open(sys.argv[1]))[0]; sys.exit(0 if c[\"value\"][\"key\"] == \"FAKE-KEY-padded\" else 1)" "$H/stub-import.json"'
+
+echo "=== 10. a failing 'auth export' still keeps the stored key (no prompt)"
+H="$(stub_home eleven)"
+echo '[{"id":"saia-gwdg","name":"SAIA (GWDG)","connections":[{"type":"credential","id":"cred_old","label":"SAIA (GWDG)","method":"key"}]}]' >"$H/stub-list.json"
+touch "$H/export-fail"
+RUN_KEY="" run "$H" --minimal; rc=$?
+check "exit 0 (rc=$rc)" '[[ $rc -eq 0 ]]'
+check "stored key kept, no prompt, nothing imported" 'grep -q "Existing saia-gwdg API key kept" "$H/install.log" && [[ ! -e "$H/stub-import.json" ]]'
+check "kept key was not validated (export failed)" '! grep -q "API key validated against SAIA" "$H/install.log"'
+check "stored key not logged out" '! grep -q "auth logout" "$H/stub-calls.log"'
 
 echo
 echo "install-modes: $pass passed, $fail failed"
